@@ -38,7 +38,8 @@
 | `vps-hardening.sh` | **主引擎**：所有加固逻辑 + 平台适配调用，支持 `--mode key\|password` |
 | `vps-hardening-no-key.sh` | 薄封装：找到主引擎后以 `--mode password` 执行（两种模式共用同一套逻辑，不会走样） |
 | `lib/platform.sh` | **跨发行版适配层**：发行版/包管理器/init/防火墙/sshd/自动更新 的检测与抽象 |
-| `tests/selftest.sh` | 自检/回归测试：`bash tests/selftest.sh`（不联网、不改动系统，124 项检查） |
+| `tests/selftest.sh` | 自检/回归测试：`bash tests/selftest.sh`（158 项，不联网、不改动系统） |
+| `tests/integration.sh` | 执行级集成测试：`bash tests/integration.sh`（27 项，沙箱内用桩命令真跑第 5、6 项） |
 | `LICENSE` | MIT |
 | `.gitattributes` / `.gitignore` | 强制 `*.sh` 用 LF；排除 `node_modules` 等 |
 
@@ -109,13 +110,16 @@ sudo bash vps-hardening-no-key.sh              # 密码登录模式（自动找�
 
 ## 自检 / 回归测试
 
-改动脚本后建议先跑一遍（纯 bash，不需要联网，也不会改动系统）：
+改动脚本后建议先跑这两套（纯 bash，不需要联网，也不会改动真实系统）：
 
 ```bash
-bash tests/selftest.sh          # 在仓库根目录执行
+bash tests/selftest.sh        # 158 项：语法、适配层函数、确认语义、IP 校验、
+                              # 发行版家族映射、包管理器/init 分支、参数处理、installer 产物校验
+bash tests/integration.sh     #  27 项：把引擎复制到沙箱并重写路径前缀，用桩命令模拟
+                              # Ubuntu+systemd+ufw+sshd，真实执行第 5、6 项
 ```
 
-它会检查：四个脚本的语法、适配层函数是否齐全（曾经漏掉 `confirm` 导致所有确认都变成"否"）、`confirm`/`confirm_timed` 在 y / n / EOF 下的行为、IPv4/IPv6 校验、**发行版家族映射**（ubuntu/debian/rocky/fedora/amzn/ol/opensuse/arch/manjaro/alpine/gentoo/void/freebsd/openbsd/darwin/solus/mageia）、各家族包管理器命令与 init 抽象是否齐备、引擎参数处理（`--step`/`--auto` 互斥、非法值）、封装脚本的模式保护。
+`integration.sh` 覆盖的是最容易"把自己锁在门外"的路径：校验通过时确实写入并应用；**生效值不符时中止并把配置撤成 `.failed`**；密码模式下密码被锁定时拒绝继续；防火墙**必须先成功放行 SSH 才允许 enable**（放行失败就绝不 enable）；**端口未知时中止**而不是猜 22；root 不能作为目标用户。
 
 ## 卡住 / 没有输出怎么办
 

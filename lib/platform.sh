@@ -39,16 +39,22 @@ confirm() {
 }
 
 # 带超时地运行命令（BSD 默认没有 timeout；能用就用，不能用就直接跑）
+# 注意：shell 函数不能交给 timeout 执行，必须直接调用
 run_timed() {
   local secs="$1"; shift
-  if need_cmd timeout; then timeout "$secs" "$@"; else "$@"; fi
+  if declare -F "$1" >/dev/null 2>&1; then
+    "$@"
+    return $?
+  fi
+  if need_cmd timeout; then HAVE_TIMEOUT=1; timeout "$secs" "$@"; else "$@"; fi
 }
 
 # 带超时的确认：无输入/EOF 时按默认值处理（避免“卡住不动”）
 # $1=提示 $2=秒数(默认15) $3=默认值 y|n(默认 y)
 confirm_timed() {
-  local msg="$1" secs="${2:-15}" def="${3:-y}" ans=""
-  printf '%b' "${C_YEL}?${C_N} $msg [y/N] ${C_CYN}(${secs}s 无输入则按默认 ${def})${C_N}:\n"
+  local msg="$1" secs="${2:-15}" def="${3:-y}" ans="" hint="[y/N]"
+  [ "$def" = "y" ] && hint="[Y/n]"
+  printf '%b' "${C_YEL}?${C_N} $msg $hint ${C_CYN}(${secs}s 无输入则按默认 ${def})${C_N}:\n"
   if read -r -t "$secs" ans; then
     case "${ans,,}" in
       '') [ "$def" = "y" ] && return 0 || return 1 ;;
@@ -79,7 +85,7 @@ INIT=""
 SUDO_GROUP=""
 SSH_SVC=""; SSH_SOCKET=""; SSHD_BIN=""; SSHD_VER=""; SSH_KBD_KEY="KbdInteractiveAuthentication"
 SSHD_T_OK=0; SSHD_TEST_OUT=""
-SSH_CONF=""; SSH_CONF_MODE=""; SSH_INCLUDE_INJECTED=0
+SSH_CONF=""; SSH_CONF_MODE=""; SSH_INCLUDE_INJECTED=0; SSH_BACKUP=""
 FW_BACKEND=""; FW_WHY=""
 HAVE_TIMEOUT=0; HAVE_SYSTEMD=0
 
@@ -131,7 +137,7 @@ plat_detect() {
     alpine) PKG=apk ;;
     gentoo) PKG=emerge ;;
     void)   PKG=xbps ;;
-    bsd)    if [ "$PLAT_ID" = "freebsd" ]; then PKG=pkg; else PKG=pkg_add; fi ;;
+    bsd)    case "$PLAT_ID" in freebsd|dragonfly) PKG=pkg ;; *) PKG=pkg_add ;; esac ;;
     *)      PKG="" ;;
   esac
 
@@ -256,7 +262,7 @@ pkg_install_fail2ban() {
     bsd)
       if [ "$PLAT_ID" = "freebsd" ]; then
         local cand=""
-        cand=$(pkg search -q -e 'py[0-9]+-fail2ban' 2>/dev/null | tail -n1)
+        cand=$(pkg search -x -q 'py[0-9]+-fail2ban' 2>/dev/null | head -n1)
         [ -n "$cand" ] || cand=py311-fail2ban
         warn "FreeBSD 上 fail2ban 的实际包名是 ${cand}，尝试安装……"
         pkg_install "$cand" && return 0
@@ -281,28 +287,47 @@ svc_exists() {
   esac
 }
 
-# BSD：OpenBSD 用 rcctl，FreeBSD/NetBSD/DragonFly 用 service
+# BSD：OpenBSD 用 rcctl，FreeBSD/DragonFly 用 rc.conf 变量（xxx_enable=YES），NetBSD 用 xxx=YES
 bsd_ctl() {
-  # $1=动作 $2=服务名
+  local action="$1" n="$2" rcvar=""
   if [ "$PLAT_ID" = "openbsd" ] && need_cmd rcctl; then
-    case "$1" in
-      status) rcctl check "$2" >/dev/null 2>&1 ;;
-      start)  rcctl start "$2" ;;
-      stop)   rcctl stop "$2" ;;
-      restart) rcctl restart "$2" ;;
-      enable) rcctl enable "$2" ;;
-      enabled) rcctl get "$2" status >/dev/null 2>&1 ;;
+    case "$action" in
+      status)  rcctl check "$n" >/dev/null 2>&1 ;;
+      start)   rcctl start "$n" ;;
+      stop)    rcctl stop "$n" ;;
+      restart) rcctl restart "$n" ;;
+      enable)  if ! rcctl enable "$n" >/dev/null 2>&1; then rcctl set "$n" status on >/dev/null 2>&1; fi ;;
+      enabled) rcctl get "$n" status >/dev/null 2>&1 ;;
+      *)       return 1 ;;
     esac
-  else
-    case "$1" in
-      status) service "$2" onestatus >/dev/null 2>&1 ;;
-      start)  service "$2" start ;;
-      stop)   service "$2" stop ;;
-      restart) service "$2" restart ;;
-      enable) if need_cmd sysrc; then sysrc "${2}_enable=YES" >/dev/null 2>&1; fi ;;
-      enabled) grep -q "^${2}_enable=\"YES\"" /etc/rc.conf 2>/dev/null ;;
-    esac
+    return $?
   fi
+
+  case "$action" in
+    status)  service "$n" onestatus >/dev/null 2>&1 ;;
+    start)   service "$n" start ;;
+    stop)    service "$n" stop ;;
+    restart) service "$n" restart ;;
+    enable)
+      case "$PLAT_ID" in
+        netbsd) rcvar="$n" ;;
+        *)      rcvar="${n}_enable" ;;
+      esac
+      if need_cmd sysrc; then
+        sysrc "${rcvar}=YES" >/dev/null 2>&1 || return 1
+      else
+        # 没有 sysrc：写 rc.conf.local（并兼容未加引号的写法）
+        grep -qE "^${rcvar}=(YES|yes|\"YES\")" /etc/rc.conf.local 2>/dev/null \
+          || echo "${rcvar}=YES" >> /etc/rc.conf.local || return 1
+      fi ;;
+    enabled)
+      case "$PLAT_ID" in
+        netbsd) rcvar="$n" ;;
+        *)      rcvar="${n}_enable" ;;
+      esac
+      grep -qE "^${rcvar}=(YES|yes|\"YES\")" /etc/rc.conf /etc/rc.conf.local 2>/dev/null ;;
+    *) return 1 ;;
+  esac
 }
 
 svc_active() {
@@ -443,7 +468,12 @@ svc_list_running() {
   case "$INIT" in
     systemd) systemctl --type=service --state=running 2>/dev/null ;;
     openrc)  rc-status --servicedir /etc/init.d 2>/dev/null | head -n 60 ;;
-    sysv)    service --status-all 2>&1 | head -n 60 ;;
+    sysv)
+      if need_cmd chkconfig; then
+        chkconfig --list 2>/dev/null | grep -E ':on|running' | head -n 60
+      else
+        ls /etc/rc3.d/S* /etc/rc2.d/S* 2>/dev/null | sed 's|.*/S[0-9]*||' | sort -u | head -n 60
+      fi ;;
     runit)   sv status /var/service/* 2>/dev/null | head -n 60 ;;
     bsd)     service -l 2>/dev/null | head -n 60 ;;
   esac
@@ -458,22 +488,37 @@ net_addrs() {
 }
 
 net_listen() {
-  if need_cmd ss; then ss -lntup 2>/dev/null || ss -lntu 2>/dev/null
-  elif need_cmd netstat; then netstat -lntup 2>/dev/null || netstat -lntu 2>/dev/null
-  elif need_cmd sockstat; then sockstat -4 -l 2>/dev/null     # FreeBSD
-  else return 1; fi
+  if need_cmd ss; then
+    ss -lntup 2>/dev/null || ss -lntu 2>/dev/null
+  elif need_cmd sockstat; then
+    # BSD：sockstat 是原生工具，优先于 netstat（BSD 的 netstat 没有 -l/-t/-u）
+    sockstat -4 -6 -l 2>/dev/null || sockstat -4 -l 2>/dev/null
+  elif need_cmd netstat; then
+    case "$PLAT_FAMILY" in
+      bsd) netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN' ;;
+      *)   netstat -lntup 2>/dev/null || netstat -lntu 2>/dev/null ;;
+    esac
+  else
+    return 1
+  fi
 }
 
-# 端口是否在监听（用于重启 SSH 后的验证）
+# 端口是否在监听（用于重启 SSH 后的验证）；返回 2 表示“本机没有可用的探测工具”
 listen_port_ok() {
   local port="$1" out=""
-  if need_cmd ss; then out=$(ss -ltn 2>/dev/null)
-  elif need_cmd netstat; then out=$(netstat -ltn 2>/dev/null)
-  elif need_cmd sockstat; then out=$(sockstat -4 -l 2>/dev/null)
+  if need_cmd ss; then
+    out=$(ss -ltn 2>/dev/null)
+  elif need_cmd sockstat; then
+    out=$(sockstat -4 -6 -l 2>/dev/null || sockstat -4 -l 2>/dev/null)
+  elif need_cmd netstat; then
+    case "$PLAT_FAMILY" in
+      bsd) out=$(netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN') ;;
+      *)   out=$(netstat -ltn 2>/dev/null) ;;
+    esac
   else
-    # 没有工具时不要“当作成功”：交给调用方用服务状态判断
     return 2
   fi
+  [ -n "$out" ] || return 2      # 探测结果为空：交给调用方按服务状态判断，不要“当作成功”
   printf '%s\n' "$out" | grep -Eq "[:.]${port}[[:space:]]"
 }
 
@@ -486,10 +531,11 @@ all_ssh_ports() {
       systemctl show -p ListenStream --value sshd.socket 2>/dev/null | tr ' ' '\n' \
         | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p'
     fi
-    # BSD：从配置文件里取
-    if [ "$PLAT_FAMILY" = "bsd" ] && [ -r /etc/ssh/sshd_config ]; then
-      awk '/^[[:space:]]*Port[[:space:]]/{print $2}' /etc/ssh/sshd_config
-    fi
+    # 老版本 OpenSSH（无 sshd -T）或 BSD：从配置文件里读 Port
+    for f in "${SSH_CONF:-}" /etc/ssh/sshd_config; do
+      [ -n "$f" ] && [ -r "$f" ] || continue
+      awk '/^[[:space:]]*Port[[:space:]]/{print $2}' "$f" 2>/dev/null
+    done
   } | grep -E '^[0-9]+$' | sort -un
 }
 
@@ -501,10 +547,17 @@ current_session_port() {
     p=$(printf '%s' "$SSH_CLIENT" | awk '{print $3}')
   fi
   if ! printf '%s' "$p" | grep -qE '^[0-9]+$'; then
+    p=""
+    # 只认 LISTEN 中的 sshd（避免把 ssh -L 本地转发端口当成 SSH 服务端口）
     if need_cmd ss; then
-      p=$(ss -tnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
+      p=$(ss -ltnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
+    elif need_cmd sockstat; then
+      p=$(sockstat -4 -6 -l 2>/dev/null | awk '/sshd/{print $6}' | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
     elif need_cmd netstat; then
-      p=$(netstat -tnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[.:]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
+      case "$PLAT_FAMILY" in
+        bsd) p=$(netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN' | awk '{print $4}' | sed -n 's/.*[.:]\([0-9]\{1,5\}\)$/\1/p' | head -n1) ;;
+        *)   p=$(netstat -ltnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[.:]\([0-9]\{1,5\}\)$/\1/p' | head -n1) ;;
+      esac
     fi
   fi
   printf '%s' "$p"
@@ -524,12 +577,19 @@ valid_ipv4() {
 valid_ipv6() {
   local ip="$1" groups n
   case "$ip" in
+    '::') return 0 ;;
     *:*) : ;;
     *) return 1 ;;
   esac
   printf '%s' "$ip" | grep -qE '^[0-9a-fA-F:]+$' || return 1
+  # 单侧冒号只允许出现在 "::" 收缩形式里：拒绝 ":1:2"、"1:2:"、"::1:" 这类写法
+  case "$ip" in
+    :*) case "$ip" in ::*) : ;; *) return 1 ;; esac ;;
+  esac
+  case "$ip" in
+    *:) case "$ip" in *::) : ;; *) return 1 ;; esac ;;
+  esac
   case "$ip" in *:::*|*::*::*) return 1 ;; esac          # 最多一个 ::
-  # 逐段检查：每段 ≤4 位十六进制
   for groups in ${ip//:/ }; do
     [ ${#groups} -le 4 ] || return 1
   done
@@ -548,9 +608,9 @@ fw_detect() {
   local forced="${VPS_FW:-}"
 
   # 1) 已在运行的防火墙优先
-  if need_cmd firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+  if need_cmd firewall-cmd && LC_ALL=C firewall-cmd --state >/dev/null 2>&1; then
     FW_BACKEND=firewalld; FW_WHY="firewalld 正在运行（本机现有防火墙，优先沿用）"
-  elif need_cmd ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+  elif need_cmd ufw && LC_ALL=C ufw status 2>/dev/null | grep -qi '^Status: active'; then
     FW_BACKEND=ufw; FW_WHY="ufw 已启用（本机现有防火墙，优先沿用）"
   fi
 
@@ -564,7 +624,8 @@ fw_detect() {
               elif need_cmd firewall-cmd; then FW_BACKEND=firewalld; FW_WHY="Arch 上检测到 firewalld"
               elif need_cmd nft; then FW_BACKEND=manual; FW_WHY="仅检测到 nftables：直接改写全局规则集可能破坏 Docker/既有规则，故交给你手工配置"
               fi ;;
-      alpine) if need_cmd ufw; then FW_BACKEND=ufw; FW_WHY="Alpine 上检测到 ufw"; else FW_BACKEND=none; FW_WHY="Alpine 默认无防火墙，可 apk add ufw"; fi ;;
+      alpine) if need_cmd ufw; then FW_BACKEND=ufw; FW_WHY="Alpine 上检测到 ufw"
+              else FW_BACKEND=ufw; FW_WHY="Alpine 上未装 ufw，将尝试 apk add ufw（需要 community 仓库）"; fi ;;
       bsd)    FW_BACKEND=manual; FW_WHY="BSD 使用 pf，需手工配置（脚本不自动改 pf.conf）" ;;
     esac
   fi
@@ -614,7 +675,16 @@ fw_allow_port() {
   local port="$1" proto="${2:-tcp}"
   case "$FW_BACKEND" in
     ufw)       ufw allow "${port}/${proto}" ;;
-    firewalld) firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null && firewall-cmd --reload >/dev/null ;;
+    firewalld)
+      if fw_is_active; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 \
+          && firewall-cmd --reload >/dev/null 2>&1
+      elif need_cmd firewall-offline-cmd; then
+        # 守护进程还没起来：用离线工具先把规则写进配置，避免“先开服务再放行”的空窗
+        firewall-offline-cmd --add-port="${port}/${proto}" >/dev/null 2>&1
+      else
+        return 1
+      fi ;;
     iptables)  iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
                  || iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT ;;
     *)         fw_manual_note; return 1 ;;
@@ -625,19 +695,29 @@ fw_delete_port() {
   local port="$1" proto="${2:-tcp}"
   case "$FW_BACKEND" in
     ufw)       ufw delete allow "${port}/${proto}" ;;
-    firewalld) firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null && firewall-cmd --reload >/dev/null ;;
+    firewalld)
+      if fw_is_active; then
+        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 \
+          && firewall-cmd --reload >/dev/null 2>&1
+      elif need_cmd firewall-offline-cmd; then
+        firewall-offline-cmd --remove-port="${port}/${proto}" >/dev/null 2>&1
+      else
+        return 1
+      fi ;;
     iptables)  iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null ;;
     *)         return 1 ;;
   esac
 }
 
 fw_allow_from() {
-  local ip="$1" port="$2" proto="${3:-tcp}"
+  local ip="$1" port="$2" proto="${3:-tcp}" fam=ipv4 ipt=iptables
+  case "$ip" in *:*) fam=ipv6; ipt=ip6tables ;; esac
   case "$FW_BACKEND" in
     ufw)       ufw allow from "$ip" to any port "$port" proto "$proto" ;;
-    firewalld) firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source address=\"$ip\" port port=\"$port\" protocol=\"$proto\" accept" >/dev/null \
+    firewalld) firewall-cmd --permanent \
+                 --add-rich-rule="rule family=\"$fam\" source address=\"$ip\" port port=\"$port\" protocol=\"$proto\" accept" >/dev/null \
                  && firewall-cmd --reload >/dev/null ;;
-    iptables)  iptables -I INPUT -s "$ip" -p "$proto" --dport "$port" -j ACCEPT ;;
+    iptables)  $ipt -I INPUT -s "$ip" -p "$proto" --dport "$port" -j ACCEPT ;;
     *)         return 1 ;;
   esac
 }
@@ -645,8 +725,14 @@ fw_allow_from() {
 fw_rule_has_port() {
   local port="$1" proto="${2:-tcp}"
   case "$FW_BACKEND" in
-    ufw)       ufw show added 2>/dev/null | grep -q "^ufw allow ${port}/${proto}\$" ;;
-    firewalld) firewall-cmd --permanent --query-port="${port}/${proto}" >/dev/null 2>&1 ;;
+    ufw)       LC_ALL=C ufw show added 2>/dev/null | grep -q "^ufw allow ${port}/${proto}\$" ;;
+    firewalld)
+      if fw_is_active; then
+        LC_ALL=C firewall-cmd --permanent --query-port="${port}/${proto}" >/dev/null 2>&1
+      else
+        # 离线模式下查配置文件
+        grep -q "<port port=\"${port}\" protocol=\"${proto}\"" /etc/firewalld/zones/*.xml 2>/dev/null
+      fi ;;
     iptables)  iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null ;;
     *)         return 1 ;;
   esac
@@ -655,8 +741,8 @@ fw_rule_has_port() {
 fw_has_global_port() {
   local port="$1" proto="${2:-tcp}"
   case "$FW_BACKEND" in
-    ufw)       ufw status 2>/dev/null | grep -Eq "^${port}/${proto}[[:space:]]+ALLOW[[:space:]]+Anywhere" ;;
-    firewalld) firewall-cmd --permanent --query-port="${port}/${proto}" >/dev/null 2>&1 ;;
+    ufw)       LC_ALL=C ufw status 2>/dev/null | grep -Eq "^${port}/${proto}[[:space:]]+ALLOW[[:space:]]+Anywhere" ;;
+    firewalld) LC_ALL=C firewall-cmd --permanent --query-port="${port}/${proto}" >/dev/null 2>&1 ;;
     iptables)  iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null ;;
     *)         return 1 ;;
   esac
@@ -665,16 +751,35 @@ fw_has_global_port() {
 fw_defaults_deny_incoming() {
   case "$FW_BACKEND" in
     ufw)       ufw default deny incoming && ufw default allow outgoing ;;
-    firewalld) firewall-cmd --permanent --zone=public --set-target=default >/dev/null 2>&1 || true ;;
+    firewalld)
+      local zone=""
+      zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+      [ -n "$zone" ] || zone=public
+      firewall-cmd --permanent --zone="$zone" --set-target=default >/dev/null 2>&1 || return 1
+      firewall-cmd --reload >/dev/null 2>&1 || return 1 ;;
     iptables)  iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT ;;
     *)         return 1 ;;
   esac
 }
 
+# 校验“默认拒绝入站”是否真的生效（这一步以前完全没有验证）
+fw_defaults_ok() {
+  case "$FW_BACKEND" in
+    ufw)       LC_ALL=C ufw status verbose 2>/dev/null | grep -q 'Default: deny (incoming)' ;;
+    firewalld)
+      local zone=""
+      zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+      [ -n "$zone" ] || zone=public
+      LC_ALL=C firewall-cmd --zone="$zone" --get-target 2>/dev/null | grep -qiE '^(default|DROP|REJECT|%%REJECT%%)$' ;;
+    iptables)  iptables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP' ;;
+    *)         return 0 ;;
+  esac
+}
+
 fw_show() {
   case "$FW_BACKEND" in
-    ufw)       ufw status numbered ;;
-    firewalld) firewall-cmd --list-all ;;
+    ufw)       LC_ALL=C ufw status numbered ;;
+    firewalld) LC_ALL=C firewall-cmd --list-all ;;
     iptables)  iptables -S ;;
   esac
 }
@@ -708,12 +813,20 @@ fw_iptables_persist() {
     debian)
       if need_cmd netfilter-persistent; then netfilter-persistent save
       elif [ -d /etc/iptables ]; then iptables-save > /etc/iptables/rules.v4; ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-      else warn "未找到 netfilter-persistent：规则重启后会丢失，请安装 iptables-persistent。"; fi ;;
+      else
+        warn "未找到 netfilter-persistent：规则重启后会丢失，请安装 iptables-persistent。"
+        return 1
+      fi ;;
     rhel)
-      if [ -d /etc/sysconfig ]; then iptables-save > /etc/sysconfig/iptables; svc_enable_only iptables || true
-      else warn "未找到 /etc/sysconfig：请确认 iptables-services 已安装以持久化规则。"; fi ;;
+      if ! svc_exists iptables && ! pkg_has iptables-services; then
+        warn "未安装 iptables-services：规则（包括 INPUT DROP）重启后会丢失，请安装后执行: service iptables save"
+        return 1
+      fi
+      iptables-save > /etc/sysconfig/iptables || return 1
+      svc_enable_only iptables || warn "iptables 服务未能设为开机启用，请手工确认。" ;;
     *)
-      warn "该发行版未自动持久化 iptables 规则，请自行保存（例如写入开机脚本）。" ;;
+      warn "该发行版未自动持久化 iptables 规则，请自行保存（例如写入开机脚本）。"
+      return 1 ;;
   esac
 }
 
@@ -731,7 +844,7 @@ plat_detect_ssh() {
 
   SSHD_VER=""
   if [ -n "$SSHD_BIN" ]; then
-    SSHD_VER=$("$SSHD_BIN" -V 2>&1 | head -n1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+/) {print $i; exit}}')
+    SSHD_VER=$("$SSHD_BIN" -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9][0-9.]*\).*/\1/p' | head -n1)
   fi
   if [ -z "$SSHD_VER" ] && need_cmd ssh; then
     SSHD_VER=$(ssh -V 2>&1 | head -n1 | sed -n 's/.*OpenSSH_\([0-9][0-9.]*\).*/\1/p')
@@ -772,30 +885,40 @@ plat_detect_ssh() {
 # 返回 1 表示无法安全地管理 sshd 配置（调用方应中止）
 ssh_conf_prepare() {
   local main_conf=/etc/ssh/sshd_config dropin_dir=/etc/ssh/sshd_config.d
+  local dropin_existed=0
   [ -f "$main_conf" ] || { err "未找到 $main_conf"; return 1; }
+  [ -d "$dropin_dir" ] && dropin_existed=1
 
-  # 备份一次（保留原始副本）
-  if [ ! -f "${main_conf}.vps-hardening.bak" ]; then
-    cp -a "$main_conf" "${main_conf}.vps-hardening.bak" 2>/dev/null \
-      && info "已备份原配置到 ${main_conf}.vps-hardening.bak"
+  # 每次运行都做一份带时间戳的备份；备份失败就直接中止（否则后面无法恢复）
+  SSH_BACKUP="${main_conf}.vps-hardening.$(date +%Y%m%d-%H%M%S).bak"
+  if ! cp -a "$main_conf" "$SSH_BACKUP" 2>/dev/null; then
+    err "无法备份 $main_conf（只读文件系统/空间不足？），已中止以避免无法回退的修改。"
+    SSH_BACKUP=""
+    return 1
   fi
+  info "已备份原配置到 $SSH_BACKUP"
+  # 只保留最近 5 份备份（避免无限堆积，同时不动更早的手工备份）
+  local old
+  for old in $(ls -1t "${main_conf}".vps-hardening.*.bak 2>/dev/null | tail -n +6); do rm -f "$old" 2>/dev/null || true; done
 
   if [ "$PLAT_FAMILY" = "bsd" ]; then
     SSH_CONF="$main_conf"; SSH_CONF_MODE=direct
     return 0
   fi
 
-  mkdir -p "$dropin_dir" 2>/dev/null || true
-
   # 情况 1：sshd_config 已经 Include drop-in 目录（Debian 系新版本、RHEL 9、Arch、SUSE 等）
   if grep -Eq "^[[:space:]]*Include[[:space:]]+${dropin_dir}/\*\.conf" "$main_conf" 2>/dev/null; then
+    mkdir -p "$dropin_dir" 2>/dev/null || true
     SSH_CONF="$dropin_dir/00-vps-hardening.conf"; SSH_CONF_MODE=dropin
     return 0
   fi
 
-  # 情况 2：drop-in 目录存在但我们没被 Include —— 在文件最前面注入 Include（首值生效，放最前才有优先级）
-  if [ -d "$dropin_dir" ] || mkdir -p "$dropin_dir" 2>/dev/null; then
+  # 情况 2：drop-in 目录本来就存在（只是没被 Include）—— 可选注入 Include。
+  # 目录原先不存在（老系统）时不新建、不注入，直接走“直改主配置”，避免在老 sshd 上写出不认识的指令。
+  if [ "$dropin_existed" = "1" ]; then
     if grep -q '^# Managed by vps-hardening' "$main_conf" 2>/dev/null; then
+      # 之前已经由本脚本注入过：同样要记录，便于中止时撤回
+      SSH_INCLUDE_INJECTED=1
       SSH_CONF="$dropin_dir/00-vps-hardening.conf"; SSH_CONF_MODE=dropin
       return 0
     fi
@@ -814,10 +937,16 @@ ssh_conf_prepare() {
     fi
     local tmp
     tmp=$(mktemp) || return 1
-    { echo '# Managed by vps-hardening: include drop-ins first (first-value-wins)'
-      echo "Include ${dropin_dir}/*.conf"
-      cat "$main_conf"
-    } > "$tmp" && cat "$tmp" > "$main_conf" && rm -f "$tmp"
+    if ! { echo '# Managed by vps-hardening: include drop-ins first (first-value-wins)'
+           echo "Include ${dropin_dir}/*.conf"
+           cat "$main_conf"
+         } > "$tmp"; then
+      rm -f "$tmp"; err "准备新配置失败，已中止。"; return 1
+    fi
+    if ! cat "$tmp" > "$main_conf"; then
+      rm -f "$tmp"; err "无法写入 $main_conf，已中止（原内容可从 $SSH_BACKUP 恢复）。"; return 1
+    fi
+    rm -f "$tmp"
     SSH_INCLUDE_INJECTED=1        # 记录：中止时需要把这段注入撤掉
     SSH_CONF="$dropin_dir/00-vps-hardening.conf"; SSH_CONF_MODE=dropin
     return 0
@@ -828,17 +957,30 @@ ssh_conf_prepare() {
   return 0
 }
 
-# 直接改主配置时：注释掉与加固相关的旧指令（幂等，大小写不敏感）
+# 直接改主配置时：注释掉本脚本将要写入的同名指令（幂等、大小写不敏感、不碰 Match 段）
+# 说明：只注释“我们确实会写入的键”。钥匙模式下不碰 MaxAuthTries/LoginGraceTime，
+#       以免把管理员原本更严格的策略悄悄放宽；Match 段内的指令不动（改动等于丢配置）。
 ssh_direct_comment_conflicts() {
-  local conf="$1" tmp
+  local conf="$1" tmp keys
   [ "$SSH_CONF_MODE" = direct ] || return 0
+  if [ "${MODE:-key}" = "password" ]; then
+    keys='^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyauthentication|permitemptypasswords|maxauthtries|logingracetime|allowusers|x11forwarding)$'
+  else
+    keys='^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyauthentication|permitemptypasswords|allowusers|x11forwarding)$'
+  fi
   tmp=$(mktemp) || return 1
-  awk '
-    { low = tolower($0); sub(/^[ \t]+/, "", low) }
-    low ~ /^#/ { print; next }
-    low ~ /^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyauthentication|maxauthtries|logingracetime|allowusers|x11forwarding|permitemptypasswords)[ \t]/ { print "# vps-hardening: " $0; next }
-    { print }
-  ' "$conf" > "$tmp" && cat "$tmp" > "$conf" && rm -f "$tmp"
+  awk -v k="$keys" '
+    { low=tolower($0); sub(/^[ \t]+/, "", low)
+      if (low ~ /^match[[:space:]]/) { inmatch=1; print; next }   # Match 段开始，之后一律不动
+      if (inmatch) { print; next }
+      if (low ~ /^#/) { print; next }
+      split(low, a, /[ \t]+/)
+      if (a[1] ~ k) { print "# vps-hardening: " $0; next }
+      print }
+  ' "$conf" > "$tmp" && cat "$tmp" > "$conf"
+  local rc=$?
+  rm -f "$tmp"
+  return $rc
 }
 
 # 语法检查；输出写入 SSHD_TEST_OUT
@@ -879,54 +1021,87 @@ ssh_effective_has_user() {
   fi
 }
 
-# 当 sshd -T 不可用（OpenSSH < 6.8）时，额外检查有没有“比我们更早生效”的 drop-in 覆盖我们的设置
+# 当 sshd -T 不可用（OpenSSH < 6.8）时：确认没有“比我们更早生效”的配置覆盖我们的设置
+# sshd 是 first-value-wins：主配置里位于 Include 之前的指令、以及字典序在我们之前的 drop-in
+# 都会先于我们生效。这里把这些情况都扫出来，扫到就中止（宁可不动 SSH）。
 ssh_conf_conflict_scan() {
-  [ "$SSH_CONF_MODE" = "dropin" ] || return 0
   [ "$SSHD_T_OK" = "1" ] && return 0
-  local keys="PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PubkeyAuthentication|MaxAuthTries|LoginGraceTime|AllowUsers|X11Forwarding|PermitEmptyPasswords"
-  local dir base f conflicts=""
-  dir=$(dirname "$SSH_CONF"); base=$(basename "$SSH_CONF")
-  for f in $(ls -1 "$dir"/*.conf 2>/dev/null | sort); do
-    [ "$(basename "$f")" = "$base" ] && break      # 到达我们的文件即停止（我们是第一个生效者）
-    if grep -Eq "^[[:space:]]*(${keys})[[:space:]]" "$f" 2>/dev/null; then
-      conflicts="$conflicts $f"
+  local keys main_conf=/etc/ssh/sshd_config dir base f conflicts="" k
+  if [ "${MODE:-key}" = "password" ]; then
+    keys='^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyauthentication|permitemptypasswords|maxauthtries|logingracetime|allowusers|x11forwarding)$'
+  else
+    keys='^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyauthentication|permitemptypasswords|allowusers|x11forwarding)$'
+  fi
+
+  if [ "${SSH_CONF_MODE:-}" = "dropin" ]; then
+    dir=$(dirname "$SSH_CONF"); base=$(basename "$SSH_CONF")
+    for f in "$dir"/*.conf; do
+      [ -e "$f" ] || continue
+      [ "$(basename "$f")" = "$base" ] && break      # 到达我们的文件即停止（我们是第一个生效者）
+      if grep -Eiq "^[[:space:]]*($(printf '%s' "$keys" | tr -d '^$()'))[[:space:]]" "$f" 2>/dev/null; then
+        conflicts="$conflicts
+  $f"
+      fi
+    done
+    # 主配置里位于第一个 Include 之前的指令会先于所有 drop-in 生效
+    if grep -Eiq '^[[:space:]]*Include[[:space:]]' "$main_conf" 2>/dev/null; then
+      if awk -v k="$keys" '
+            { line=$0; sub(/^[ \t]+/, "", line); split(line, a, /[ \t]+/);
+              if (tolower(a[1]) == "include") exit;
+              if (tolower(a[1]) ~ k) found=1 }
+            END { exit !found }' "$main_conf"; then
+        conflicts="$conflicts
+  $main_conf（Include 之前的同名指令会优先生效）"
+      fi
     fi
-  done
+  else
+    # 直改模式：确认我们带标记的块之前没有仍生效的同名指令
+    if awk -v k="$keys" '
+          { low=tolower($0); sub(/^[ \t]+/, "", low)
+            if (low ~ /^# ===== vps-hardening begin =====/) exit
+            if (low ~ /^#/) next
+            split(low, a, /[ \t]+/)
+            if (a[1] ~ k) found=1 }
+          END { exit !found }' "$SSH_CONF"; then
+      conflicts="$conflicts
+  $SSH_CONF（我们的配置块之前仍有同名指令）"
+    fi
+  fi
+
   if [ -n "$conflicts" ]; then
-    err "以下配置文件的字典序在本脚本之前，会优先于我们的设置（且本机 sshd 不支持 -T 校验）："
-    printf '%s\n' $conflicts | sed 's/^/  /'
-    info "请手工处理（改名/删除/合并）后重试。"
+    err "本机 sshd 不支持 -T 校验，且检测到可能覆盖加固设置的配置：$conflicts"
+    info "请手工处理（改名/删除/合并）后重试；本次不会修改或重启 SSH。"
     return 1
   fi
   return 0
 }
 
 # 应用配置：重新加载/重启监听进程，然后验证端口仍在监听
+# 关键：端口在监听并不等于新配置已生效，所以必须同时要求“重启动作本身成功”
 ssh_apply_and_verify() {
   local ports="$1" unit="" p listening=0 probe=0 rc=0
   svc_daemon_reload
 
   if [ "$INIT" = "systemd" ]; then
+    unit="$SSH_SVC"
     if [ -n "$SSH_SOCKET" ] && systemctl is-enabled --quiet "$SSH_SOCKET" 2>/dev/null; then
-      systemctl restart "$SSH_SOCKET" 2>/dev/null && unit="$SSH_SOCKET"
-    fi
-    if [ -z "$unit" ] || systemctl is-enabled --quiet "${SSH_SVC}.service" 2>/dev/null; then
+      # socket 激活：重启 socket 才是真正让新配置生效的动作
+      if systemctl restart "$SSH_SOCKET"; then unit="$SSH_SOCKET"; else rc=1; fi
       systemctl try-restart "${SSH_SVC}.service" >/dev/null 2>&1 || true
-      [ -z "$unit" ] && unit="${SSH_SVC}.service"
-    fi
-    if [ -z "$unit" ]; then
-      if systemctl restart "${SSH_SVC}.service" >/dev/null 2>&1; then unit="${SSH_SVC}.service"; fi
-    fi
-    # 兜底：socket 激活场景下 service 平时是 inactive，别把它当成失败
-    [ -n "$unit" ] || unit="$SSH_SVC"
-  else
-    if svc_restart "$SSH_SVC" >/dev/null 2>&1; then
-      unit="$SSH_SVC"
-      rc=0
     else
-      rc=1
-      unit="$SSH_SVC"
+      if systemctl try-restart "${SSH_SVC}.service"; then
+        unit="${SSH_SVC}.service"
+      else
+        rc=1
+      fi
+      # try-restart 只对“正在运行”的服务生效；若服务未运行（例如由别的方式监听），补一次 start
+      if [ "$rc" = "1" ] && systemctl start "${SSH_SVC}.service" >/dev/null 2>&1; then
+        rc=0; unit="${SSH_SVC}.service"
+      fi
     fi
+  else
+    unit="$SSH_SVC"
+    if svc_restart "$SSH_SVC"; then rc=0; else rc=1; fi
   fi
 
   sleep 2
@@ -936,27 +1111,38 @@ ssh_apply_and_verify() {
     listen_port_ok "$p"
     case $? in
       0) listening=1 ;;
-      2) probe=1 ;;      # 无法探测
+      2) probe=1 ;;
     esac
   done
+
+  # 重启动作失败 → 直接判失败（旧 sshd 可能仍在监听同一个端口，不能据此判定成功）
+  if [ "$rc" != "0" ]; then
+    err "重启 SSH 失败（$unit）：新配置可能未生效。请用厂商 Console 检查。"
+    case "$INIT" in
+      systemd) err "  journalctl -u ${SSH_SVC} --no-pager | tail -n 20" ;;
+      openrc)  err "  rc-service $SSH_SVC status" ;;
+      bsd)     err "  service $SSH_SVC status（OpenBSD 用 rcctl check sshd）" ;;
+      *)       err "  $SSHD_BIN -t 以及系统日志" ;;
+    esac
+    return 1
+  fi
 
   if [ "$listening" = "1" ]; then
     ok "配置已应用：${unit:-$SSH_SVC} 正在监听 $(printf '%s' "$ports" | tr '\n' ' ')"
     return 0
   fi
 
-  # 探测不到时：用服务状态兜底，但必须确实与重启结果一致，不能“当作成功”
-  if [ "$probe" = "1" ] && [ "$rc" = "0" ] && svc_active "$SSH_SVC"; then
-    warn "本机缺少 ss/netstat/sockstat，无法验证端口监听；已确认 $SSH_SVC 处于运行状态。"
+  # 探测不到时用服务状态兜底，但必须重启成功且服务确实在跑
+  if [ "$probe" = "1" ] && svc_active "$SSH_SVC"; then
+    warn "本机缺少 ss/netstat/sockstat（或输出为空），无法验证端口监听；已确认 $SSH_SVC 处于运行状态。"
     return 0
   fi
 
-  err "未检测到 SSH 端口在监听（可能是重启失败或端口探测工具缺失）！"
-  err "请勿断开当前连接，立即用厂商 Console 检查："
+  err "未检测到 SSH 端口在监听！请勿断开当前连接，立即用厂商 Console 检查："
   case "$INIT" in
     systemd) err "  journalctl -u ${SSH_SVC} --no-pager | tail -n 20" ;;
     openrc)  err "  rc-service $SSH_SVC status" ;;
-    bsd)     err "  service $SSH_SVC status   （OpenBSD 用 rcctl check sshd）" ;;
+    bsd)     err "  service $SSH_SVC status（OpenBSD 用 rcctl check sshd）" ;;
     *)       err "  $SSHD_BIN -t 以及系统日志（/var/log/auth.log 或 /var/log/secure）" ;;
   esac
   return 1

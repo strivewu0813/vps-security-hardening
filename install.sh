@@ -32,6 +32,12 @@
 
 set -uo pipefail
 
+# 必须用 bash 运行（dash/sh 会在数组语法处报错，报错信息很难懂）
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "请用 bash 运行本脚本：sudo bash install.sh（当前 shell 不是 bash）" >&2
+  exit 1
+fi
+
 REPO="${REPO:-strivewu0813/vps-security-hardening}"
 REF="main"
 INSTALL_DIR="/usr/local/bin"
@@ -119,35 +125,38 @@ base_urls() {
   printf '%s\n' "https://cdn.jsdelivr.net/gh/$REPO@$REF"
 }
 
-# 校验下载结果确实是我们期望的脚本（防止拿到 HTML 错误页或截断内容）
-# 主脚本/封装：以 #!/...bash 开头且含 main "$@"；平台适配层：含 plat_detect 定义
+# 校验下载结果确实是我们期望的文件（防止拿到 HTML 错误页或截断内容）
+# 用法：valid_script <文件> <必需的正则1> [必需的正则2 ...]
+# 用“行首锚定”的正则作为标记：这样 install.sh 自己引用的这些字符串不会被误判成产物。
 valid_script() {
-  local f="$1"
+  local f="$1"; shift
   [ -s "$f" ] || return 1
   head -n1 "$f" | grep -q 'bash' || return 1
-  if grep -q '^plat_detect()' "$f"; then
-    grep -q 'ssh_apply_and_verify\|ssh_conf_prepare' "$f" || return 1
-    return 0
-  fi
-  grep -q '^main "\$@"' "$f" || return 1
-  grep -q 'vps-hardening' "$f" || return 1
+  local m
+  for m in "$@"; do
+    grep -qE -- "$m" "$f" || return 1
+  done
   return 0
 }
 
-# 取得脚本内容：优先本地目录，其次按镜像列表逐个下载
+# 取得文件内容：优先本地目录，其次按镜像列表逐个下载
 acquire() {
-  local name="$1" dest="$2" base url tmp
-  if [ -n "${SELF_DIR:-}" ] && valid_script "$SELF_DIR/$name"; then
+  local name="$1" dest="$2"
+  shift 2
+  local markers=("$@")
+  local base url tmp
+  if [ -n "${SELF_DIR:-}" ] && valid_script "$SELF_DIR/$name" ${markers[@]+"${markers[@]}"}; then
     info "使用本地文件: $SELF_DIR/$name"
     cp -f "$SELF_DIR/$name" "$dest" || return 1
     return 0
   fi
   tmp=$(mktemp) || { err "无法创建临时文件"; return 1; }
+  trap 'rm -f "${tmp:-}"' EXIT INT TERM HUP
   while IFS= read -r base; do
     [ -n "$base" ] || continue
     url="$base/$name"
     info "下载: $url"
-    if fetch "$url" "$tmp" && valid_script "$tmp"; then
+    if fetch "$url" "$tmp" && valid_script "$tmp" ${markers[@]+"${markers[@]}"}; then
       if cp -f "$tmp" "$dest"; then
         rm -f "$tmp"
         ok "已获取 $name"
@@ -170,9 +179,11 @@ install_scripts() {
   mkdir -p "$lib_dir" 2>/dev/null || { err "无法创建 $lib_dir"; return 1; }
   backup_foreign "$key_dest"
   backup_foreign "$nokey_dest"
-  acquire "vps-hardening.sh" "$key_dest" || return 1
-  acquire "vps-hardening-no-key.sh" "$nokey_dest" || return 1
-  acquire "lib/platform.sh" "$lib_dest" || return 1
+  backup_foreign "$lib_dest"
+  # 先装平台层：主引擎没有它就跑不起来（否则会出现“引擎装了、层没装”的半残状态）
+  acquire "lib/platform.sh" "$lib_dest" '^plat_detect\(\) \{' '^ssh_apply_and_verify\(\)' || return 1
+  acquire "vps-hardening.sh" "$key_dest" '^step5_sshd\(\)' '^build_ssh_block\(\)' || return 1
+  acquire "vps-hardening-no-key.sh" "$nokey_dest" '^is_engine\(\)' '^exec bash "\$engine" --mode password' || return 1
   chmod 755 "$key_dest" "$nokey_dest" 2>/dev/null || true
   chmod 644 "$lib_dest" 2>/dev/null || true
   return 0
@@ -205,13 +216,14 @@ run_script() {
     bash "$target" "$@"
     return $?
   fi
-  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  # 注意：[ -r /dev/tty ] 只是权限位测试，没有控制终端时也会为真；必须真的能打开
+  if { : < /dev/tty; } 2>/dev/null; then
     info "检测到通过管道运行：交互输入已切换到 /dev/tty"
     bash "$target" "$@" < /dev/tty
     return $?
   fi
-  err "当前没有可用的交互终端（/dev/tty 不可用），无法进行交互式加固。"
-  err "请手动执行: sudo $target $*"
+  err "当前没有可用的交互终端（/dev/tty 打不开），无法进行交互式加固。"
+  err "请在 SSH 会话里手动执行: sudo $target $*"
   return 1
 }
 
@@ -278,6 +290,21 @@ main() {
   info "仓库: $REPO   分支/标签: $REF"
   if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/vps-hardening.sh" ]; then
     info "检测到本地脚本目录，将使用本地文件（不联网）"
+    if [ -n "${MIRROR_OVERRIDE:-}" ] || [ "$REF" != "main" ]; then
+      warn "注意：本地目录优先于 --ref/--mirror，因此本次不会从远端拉取指定版本。"
+    fi
+  fi
+
+  # 需要 curl 或 wget 之一；缺失时给出明确原因（否则只会看到“所有来源均失败”）
+  if [ -z "$SELF_DIR" ] || [ ! -f "$SELF_DIR/vps-hardening.sh" ]; then
+    if ! need_cmd curl && ! need_cmd wget; then
+      err "未找到 curl 或 wget，无法下载脚本。请先安装其中一个，例如："
+      case "${PLAT_FAMILY:-}" in
+        rhel) info "  sudo dnf install -y curl" ;;
+        *)    info "  sudo apt-get install -y curl   （或 apk add curl / pacman -S curl）" ;;
+      esac
+      exit 1
+    fi
   fi
 
   install_scripts || exit 1

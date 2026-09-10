@@ -3,7 +3,7 @@ node_modules/
 package.json
 package-lock.json
 
-# ç¼–è¾‘å™¨ / ç³»ç»Ÿæ–‡ä»¶
+# ç¼–è¾‘å™?/ ç³»ç»Ÿæ–‡ä»¶
 .vscode/
 .idea/
 *.swp
@@ -13,3 +13,6 @@ Thumbs.db
 # æœ¬åœ°ä¸´æ—¶äº§ç‰©
 *.log
 *.bak
+
+# ×Ô¼ìÌ×¼şÉú³ÉµÄ¼ÙÃüÁîÄ¿Â¼
+tests/fakebin/
