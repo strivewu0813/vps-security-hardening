@@ -1,209 +1,135 @@
 #!/usr/bin/env bash
 #=============================================================================
-# vps-hardening.sh
-# 新 VPS 基础安全一键加固脚本（SSH Key 版）
+# vps-hardening.sh — 新 VPS 基础安全一键加固（跨 Linux 发行版 / BSD）
 #
-# 适用环境：Ubuntu 24.04 LTS / 初始 root 或具备 sudo 权限的管理员
-# 适用场景：准备部署 3X-UI / VLESS Reality / Hysteria2 / Trojan 的节点 VPS
+# 支持两种登录模式：
+#   --mode key        使用 SSH Key 登录，关闭密码认证（默认，最安全）
+#   --mode password   保持“用户名 + 密码”登录（等价于旧的 no-key 版本）
+#   别名：--key / --no-key
+#
+# 支持的平台（自动检测，逐步降级）：
+#   Debian/Ubuntu/Mint/Kali、RHEL/CentOS/Rocky/Alma/Fedora/Amazon、openSUSE/SLES、
+#   Arch/Manjaro、Alpine、Gentoo、Void、FreeBSD/OpenBSD/NetBSD/DragonFly
+#   包管理器：apt/dnf/yum/zypper/pacman/apk/emerge/xbps/pkg/pkg_add
+#   init：systemd/openrc/sysv/runit/BSD rc
+#   防火墙：ufw/firewalld/nftables/iptables（BSD 的 pf 给出手工指引）
 #
 # 用法：
-#   sudo bash vps-hardening.sh              # 交互式菜单
-#   sudo bash vps-hardening.sh --auto       # 按推荐顺序执行第 2~8 项（逐步确认）
-#   sudo bash vps-hardening.sh --step N     # 只执行某项（N=2..10）
-#   sudo bash vps-hardening.sh --fail2ban   # 只执行第 8 项 Fail2ban
+#   sudo bash vps-hardening.sh                      # 交互式菜单（Key 模式）
+#   sudo bash vps-hardening.sh --mode password       # 密码登录模式
+#   sudo bash vps-hardening.sh --auto                # 顺序执行第 2~8 项
+#   sudo bash vps-hardening.sh --step N              # 只执行某项（N=2..10）
+#   sudo bash vps-hardening.sh --fail2ban            # 只执行第 8 项
+#   sudo bash vps-hardening.sh --setup-only          # 只安装 lib 等依赖后退出
 #
-# 卡住 / 没有输出时：用 DEBUG=1 查看每条命令的执行进度
-#   sudo DEBUG=1 bash vps-hardening.sh 2>&1 | tee /tmp/hardening-debug.log
+# 环境变量：
+#   DEBUG=1        打印每条命令（排查“卡住/没有回显”）
+#   FORCE=1        跳过第 5 项“新窗口已验证”的人工确认（谨慎）
+#   VPS_FW=ufw|firewalld|nftables|iptables|none   强制指定防火墙后端
+#   VPS_REPO / VPS_REF                            指定脚本仓库与分支（自建镜像时用）
 #
-# ⚠️ 重要安全提示（务必遵守）：
-#   1. 第 1 项(厂商 Console / MFA / 快照)只能在服务商后台手动完成，本脚本只负责提醒。
-#   2. 任何可能影响 SSH 登录的配置，都必须先保留旧连接，再使用【新窗口】完成验证；
-#      在 SSH Key 未通过新窗口验证之前，不要关闭密码登录，不要退出当前 SSH 会话。
-#   3. 其他 Linux 发行版请参考思路，不建议直接逐条复制本脚本。
-#   4. 环境变量 FORCE=1 可跳过第 5 项的人工确认（仅用于已确认过新窗口验证的重复执行，请谨慎使用）。
+# ⚠️ 安全原则（务必遵守）：
+#   1. 第 1 项（厂商 Console / MFA / 快照）必须在服务商后台手动完成，脚本只提醒。
+#   2. 先保留旧连接，再用【新窗口】验证新登录方式；验证通过前不要关闭旧方式。
+#   3. 任何校验不通过都会中止并自动撤下未生效的配置，绝不带着坏配置重启 SSH。
 #=============================================================================
 
 set -uo pipefail
 
-#---------------------------- 颜色 / 日志 ----------------------------#
-C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'
-C_CYN=$'\e[36m'; C_BLD=$'\e[1m';   C_N=$'\e[0m'
+MODE="${MODE:-key}"          # key（默认，关闭密码认证）| password（保留密码登录）
 
-LOG_FILE=/var/log/vps-hardening.log
+REPO="${VPS_REPO:-strivewu0813/vps-security-hardening}"
+REF="${VPS_REF:-main}"
 CTX_FILE=/root/.vps-hardening-ctx
+LOG_FILE=/var/log/vps-hardening.log
 
-info() { printf '%b' "${C_CYN}[INFO]${C_N} $*\n"; }
-ok()   { printf '%b' "${C_GRN}[ OK ]${C_N} $*\n"; }
-warn() { printf '%b' "${C_YEL}[WARN]${C_N} $*\n" >&2; }
-err()  { printf '%b' "${C_RED}[ERR ]${C_N} $*\n" >&2; }
-hdr()  { printf '%b' "\n${C_BLD}${C_CYN}========== $* ==========${C_N}\n"; }
+#------------------------------ 加载平台适配层 ------------------------------#
 
-log()  { printf '%s  %s\n' "$(date '+%F %T')" "$*" | sudo tee -a "$LOG_FILE" >/dev/null 2>&1 || true; }
+_lib_ok() { [ -r "$1" ] && grep -q 'plat_detect' "$1" 2>/dev/null; }
 
-#---------------------------- 辅助函数 ----------------------------#
-confirm() {
-  local msg="$1" ans
-  printf '%b' "${C_YEL}?${C_N} $msg [y/N]:\n"
-  read -r ans || ans=n
-  case "${ans,,}" in y|yes) return 0;; *) return 1;; esac
+load_platform_lib() {
+  local self="${BASH_SOURCE[0]:-}" dir="" cand
+  if [ -n "$self" ] && [ -f "$self" ]; then dir=$(cd -- "$(dirname -- "$self")" >/dev/null 2>&1 && pwd); fi
+  for cand in \
+    "${dir:-/nonexistent}/lib/platform.sh" \
+    "${dir:-/nonexistent}/platform.sh" \
+    /usr/local/lib/vps-hardening/platform.sh \
+    /usr/local/lib/vps-hardening.sh
+  do
+    if _lib_ok "$cand"; then . "$cand"; return 0; fi
+  done
+
+  printf '%s\n' "未找到 lib/platform.sh（跨发行版适配层），尝试从 GitHub 下载……"
+  local dest_dir=/usr/local/lib/vps-hardening dest="$dest_dir/platform.sh" tmp base url
+  mkdir -p "$dest_dir" 2>/dev/null || dest=/tmp/platform.sh
+  tmp=$(mktemp) || { printf '%s\n' "无法创建临时文件，请手动放置 lib/platform.sh"; exit 1; }
+  for base in "https://raw.githubusercontent.com/$REPO/$REF" "https://cdn.jsdelivr.net/gh/$REPO@$REF"; do
+    url="$base/lib/platform.sh"
+    printf '%s\n' "下载: $url"
+    if need_dl "$url" "$tmp" && _lib_ok "$tmp"; then
+      cat "$tmp" > "$dest" && rm -f "$tmp" && . "$dest" && return 0
+    fi
+    printf '%s\n' "该来源不可用，尝试下一个……"
+  done
+  rm -f "$tmp"
+  printf '%s\n' "无法获取 lib/platform.sh。"
+  printf '%s\n' "请用 install.sh 安装，或手动下载后放在脚本同目录的 lib/ 下："
+  printf '%s\n' "  curl -fsSL $REPO 的 lib/platform.sh  →  $(dirname "$0")/lib/platform.sh"
+  exit 1
 }
 
-# 带超时的确认：无输入/EOF 时按默认值处理，避免“卡在预检”这类无限等待
-# $1=提示 $2=秒数(默认15) $3=默认值 y|n(默认 y)
-confirm_timed() {
-  local msg="$1" secs="${2:-15}" def="${3:-y}" ans=""
-  printf '%b' "${C_YEL}?${C_N} $msg [y/N] ${C_CYN}(${secs}s 无输入则按默认 ${def})${C_N}:\n"
-  if read -r -t "$secs" ans; then
-    case "${ans,,}" in
-      '') [ "$def" = "y" ] && return 0 || return 1 ;;
-      y|yes) return 0 ;;
-      *) return 1 ;;
-    esac
-  fi
-  echo
-  warn "${secs}s 内没有输入，按默认 ${def} 处理。"
-  [ "$def" = "y" ]
+need_dl() {
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 15 --max-time 120 -o "$2" "$1"
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 30 -O "$2" "$1"
+  else return 127; fi
 }
 
-# 读取一行输入：提示独占一行，避免某些终端（如厂商 VNC Console）不渲染无换行提示符
-ask() {
-  local prompt="$1" var="$2" ans=""
-  printf '%s\n> ' "$prompt"
-  IFS= read -r ans || return 1
-  printf -v "$var" '%s' "$ans"
-  return 0
-}
+load_platform_lib
 
-# 带超时地运行命令：某些环境（网络被墙、ss -p 卡住等）可能长时间无输出
-run_timed() {
-  local secs="$1"; shift
-  if need_cmd timeout; then timeout "$secs" "$@"; else "$@"; fi
-}
+#------------------------------ 脚本级辅助 ------------------------------#
 
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
+log() { printf '%s  %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null || true; }
 
-ensure_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "需要 root 权限，尝试用 sudo 重新执行……"
-    exec sudo -E bash "$0" "$@"
-  fi
-}
-
-# 所有可能接受 SSH 连接的端口（sshd 配置 + ssh.socket 的 ListenStream），去重排序
-all_ssh_ports() {
-  {
-    sshd -T 2>/dev/null | awk '/^port /{print $2}'
-    systemctl show -p Listen --value ssh.socket 2>/dev/null | tr ' ' '\n' \
-      | sed -n 's/.*:\([0-9]\{1,5\}\)$/\1/p'
-  } | grep -E '^[0-9]+$' | sort -un
-}
-
-# 当前 SSH 会话连接的服务端端口（防火墙放行与校验都要覆盖它，避免换端口后失联）
-current_session_port() {
-  local p=""
-  if [ -n "${SSH_CONNECTION:-}" ]; then
-    p=${SSH_CONNECTION##* }
-  fi
-  if ! printf '%s' "$p" | grep -qE '^[0-9]+$'; then
-    p=$(ss -tnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*:\([0-9]\{1,5\}\)$/\1/p' | head -n1)
-  fi
-  printf '%s' "$p"
-}
-
-# 校验失败/中止时把未采用的 SSH 配置挪走，防止后续连接读到未验证或不完整的配置
 abort_conf() {
-  local conf="$1"
-  if [ -f "$conf" ]; then
+  local conf="${1:-}" main_conf=/etc/ssh/sshd_config
+  # 1) 如果注入过 Include，先恢复主配置（否则重启后可能因不支持的指令导致 sshd 起不来）
+  if [ "${SSH_INCLUDE_INJECTED:-0}" = "1" ] && [ -f "${main_conf}.vps-hardening.bak" ]; then
+    if cp -a "${main_conf}.vps-hardening.bak" "$main_conf"; then
+      warn "已移除注入的 Include 行并恢复加固前的 $main_conf"
+      SSH_INCLUDE_INJECTED=0
+      if [ -n "$SSHD_BIN" ] && ! sshd_test; then
+        warn "恢复后 sshd -t 仍报错，请手工检查 $main_conf："
+        printf '%s\n' "${SSHD_TEST_OUT:-}" | sed 's/^/  /'
+      fi
+    fi
+  fi
+  # 2) 直改模式：从备份恢复
+  if [ "${SSH_CONF_MODE:-}" = "direct" ]; then
+    if [ -f "${main_conf}.vps-hardening.bak" ]; then
+      cp -a "${main_conf}.vps-hardening.bak" "$main_conf" \
+        && warn "已恢复加固前的 $main_conf（备份文件保留）"
+    fi
+    return 0
+  fi
+  # 3) drop-in 模式：把我们写进去的文件挪走
+  if [ -n "$conf" ] && [ -f "$conf" ]; then
     if mv "$conf" "${conf}.failed" 2>/dev/null; then
-      warn "已把未采用的配置移到 ${conf}.failed（sshd 不再读取它；确认无误后可自行删除）"
+      warn "已把未采用的配置移到 ${conf}.failed（sshd 不再读取；确认无误后可删除）"
     else
-      warn "注意：$conf 仍在原处，请手动检查或删除，否则后续 SSH 连接可能受影响。"
+      warn "注意：$conf 仍在原处，请手动检查或删除。"
     fi
   fi
 }
 
-os_check() {
-  if [ -r /etc/os-release ]; then . /etc/os-release; fi
-  hdr "0. 系统与 VPS 身份预检"
-  info "[1/5] 系统信息"
-  info "  ${PRETTY_NAME:-未知}  (ID=${ID:-未知} VERSION_ID=${VERSION_ID:-未知})"
-  case "${ID:-}" in
-    ubuntu|debian)
-      if [ "${VERSION_ID:-}" != "24.04" ]; then
-        warn "教程以 Ubuntu 24.04 LTS 为例。您当前是 ${PRETTY_NAME:-?}：命令大体通用，但请自行核对。"
-        confirm_timed "是否继续？" 15 y || { err "已按要求退出（未做任何修改）。"; exit 0; }
-      fi ;;
-    *)
-      warn "未识别到 Ubuntu / Debian（当前 ID=${ID:-未知}），本脚本命令可能不适用。"
-      confirm_timed "仍然继续？" 20 n || { err "已退出（未做任何修改）。"; exit 0; }
-      ;;
-  esac
-
-  info "[2/5] 公网 IP / 地区 / ASN（不通会自动跳过，最多等 8 秒）"
-  if need_cmd curl; then
-    curl -s --connect-timeout 4 --max-time 8 ipinfo.io \
-      || warn "ipinfo.io 不可达，已跳过。可稍后手动执行: curl -s ipinfo.io"
-  else
-    warn "未安装 curl，已跳过。可稍后手动执行: curl -s ipinfo.io"
-  fi
-
-  info "[3/5] 本机网卡地址"
-  run_timed 10 ip -br addr 2>/dev/null | sed 's/^/  /'
-
-  info "[4/5] SSH 端口与监听端口（最多等 10 秒）"
-  info "  SSH 实际端口: $(run_timed 5 sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -n1)"
-  run_timed 10 ss -lntup 2>/dev/null | sed 's/^/  /'
-
-  info "[5/5] 需要你手动确认的事项"
-  warn "请现在就在服务商后台实际登录一次 Console / VNC，并确认快照与云防火墙入口存在。"
-  ok "预检完成。"
-}
-
-#---------------------------- 第 2 项：更新系统安全补丁 ----------------------------#
-step2_update() {
-  hdr "第 2 项：更新系统安全补丁"
-  info "apt update && upgrade ……（可能需要几分钟）"
-  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  apt-get update || { err "apt update 失败"; return 1; }
-  apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade \
-    || { err "apt upgrade 失败"; return 1; }
-  ok "系统软件包已更新。"
-
-  if [ -f /var/run/reboot-required ]; then
-    warn "检测到需要重启（/var/run/reboot-required）:"
-    cat /var/run/reboot-required 2>/dev/null | sed 's/^/  /'
-    if confirm "现在重启？(重启后请重新执行本脚本继续)"; then
-      info "重启中……重启完成后重新运行: sudo bash $0 --auto"
-      systemctl reboot
-      exit 0
-    else
-      warn "已选择暂不重启。部分安全补丁要重启后才生效，建议稍后手动重启。"
-    fi
-  fi
-
-  info "配置自动安全更新 unattended-upgrades ……"
-  if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
-    apt-get install -y unattended-upgrades || { err "安装 unattended-upgrades 失败"; return 1; }
-  fi
-  printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
-    > /etc/apt/apt.conf.d/20auto-upgrades
-  dpkg-reconfigure -f noninteractive -plow unattended-upgrades >/dev/null 2>&1 || true
-  systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
-  systemctl status unattended-upgrades --no-pager 2>/dev/null | head -n 5 | sed 's/^/  /'
-  ok "自动安全更新已启用。"
-  info "注意：3X-UI / Xray 等业务程序的大版本升级，仍建议先备份 → 再升级 → 再验证。"
-}
-
-# 选择要操作的管理员用户：若存在第 3 项的记录，先展示并要求确认，避免误操作到其它用户
 pick_user() {
   NEW_USER=""
   if [ -s "$CTX_FILE" ]; then
     # shellcheck disable=SC1090
     . "$CTX_FILE"
     if [ -n "${NEW_USER:-}" ]; then
-      info "第 3 项创建/记录的管理员用户: $NEW_USER"
+      info "上次记录的管理员用户: $NEW_USER"
       local ans=""
-      printf '%b' "${C_YEL}?${C_N} 就操作该用户？[Y/n] "
+      printf '%b' "${C_YEL}?${C_N} 就操作该用户？[Y/n]:\n"
       read -r ans || ans=y
       case "${ans,,}" in n|no) NEW_USER="" ;; esac
     fi
@@ -211,69 +137,320 @@ pick_user() {
   if [ -z "${NEW_USER:-}" ]; then
     ask "输入管理员用户名:" NEW_USER || return 1
   fi
-  # 关键闸门：绝不允许对 root 执行。第 5 项会写 PermitRootLogin no 且 AllowUsers 只保留该用户，
-  # 若这里是 root，则 root 被 PermitRootLogin 拒绝、其他人被 AllowUsers 拒绝 → 所有 SSH 登录失败。
-  if [ "$(id -u "$NEW_USER" 2>/dev/null)" = "0" ]; then
-    err "不允许对 root 账户执行本流程（会导致所有 SSH 登录被拒绝）。请先用菜单 3 创建普通用户。"
+  if ! printf '%s' "$NEW_USER" | grep -qE '^[a-z_][a-z0-9_-]*$'; then
+    err "用户名不合法（只能用 a-z0-9_- 且以字母/下划线开头）：'$NEW_USER'"
     return 1
   fi
+  if [ "$(id -u "$NEW_USER" 2>/dev/null)" = "0" ]; then
+    err "不允许对 root 账户执行本流程（会让所有 SSH 登录被拒）。请先创建普通用户。"
+    return 1
+  fi
+  return 0
 }
 
-#---------------------------- 第 3 项：创建普通 sudo 管理用户 ----------------------------#
+user_shell() {
+  if need_cmd getent; then getent passwd "$1" | awk -F: '{print $7}'
+  else awk -F: -v u="$1" '$1==u{print $7}' /etc/passwd; fi
+}
+
+user_exists() { id "$1" >/dev/null 2>&1; }
+
+# 0=有可用密码 1=无/锁定 2=无法判定
+password_status() {
+  local u="$1" st="" h=""
+  if need_cmd passwd; then
+    st=$(passwd -S "$u" 2>/dev/null | awk '{print $2}')
+    case "$st" in
+      P) return 0 ;;
+      L|LK|NP) return 1 ;;
+    esac
+  fi
+  if [ -r /etc/shadow ]; then h=$(awk -F: -v u="$u" '$1==u{print $2}' /etc/shadow)
+  elif [ -r /etc/master.passwd ]; then h=$(awk -F: -v u="$u" '$1==u{print $2}' /etc/master.passwd); fi
+  case "$h" in
+    '') return 2 ;;
+    '*'|'!'*|'*LK*'|'*LOCKED*') return 1 ;;
+    \$*) return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
+create_admin_user() {
+  local u="$1" shell="/bin/bash" rc=0
+  [ -x /bin/bash ] || shell=/bin/sh
+  case "$PLAT_FAMILY" in
+    bsd)
+      if [ "$PLAT_ID" = "freebsd" ] || [ "$PLAT_ID" = "dragonfly" ]; then
+        pw useradd "$u" -m -s "$shell" ${SUDO_GROUP:+-G "$SUDO_GROUP"} || rc=1
+      else
+        useradd -m -s "$shell" ${SUDO_GROUP:+-G "$SUDO_GROUP"} "$u" || rc=1
+      fi ;;
+    *)
+      useradd -m -s "$shell" "$u" || rc=1 ;;
+  esac
+  return $rc
+}
+
+add_to_admin_group() {
+  local u="$1"
+  [ -n "$SUDO_GROUP" ] || { warn "未找到 sudo/wheel 组，将只依赖 sudoers 文件授权。"; return 0; }
+  case "$PLAT_FAMILY" in
+    bsd)
+      if [ "$PLAT_ID" = "freebsd" ] || [ "$PLAT_ID" = "dragonfly" ]; then pw groupmod "$SUDO_GROUP" -m "$u" || true
+      else usermod -G "$SUDO_GROUP" "$u" 2>/dev/null || true; fi ;;
+    *)
+      usermod -aG "$SUDO_GROUP" "$u" || true ;;
+  esac
+}
+
+# 统一用 sudoers.d 授权，避免各发行版组配置差异导致 sudo 不可用
+grant_sudo_via_sudoers() {
+  local u="$1" f="/etc/sudoers.d/10-vps-hardening-${u}"
+  mkdir -p /etc/sudoers.d 2>/dev/null || true
+  printf '# 由 vps-hardening 生成\n%s ALL=(ALL:ALL) ALL\n' "$u" > "$f" || return 1
+  chmod 440 "$f" 2>/dev/null || true
+  if need_cmd visudo; then
+    if ! visudo -cf "$f" >/dev/null 2>&1; then
+      err "sudoers 语法检查失败，已删除 $f"
+      rm -f "$f"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+#------------------------------ 预检 ------------------------------#
+
+os_check() {
+  hdr "0. 系统与平台预检"
+  plat_detect
+  info "[1/5] 平台信息"
+  plat_report
+
+  if ! plat_is_supported; then
+    warn "未识别的平台（$PLAT_NAME）：脚本会尽量按通用方式执行，但包管理/防火墙/自动更新可能无法自动处理。"
+    confirm_timed "仍然继续？（无输入默认退出）" 20 n || { err "已退出（未做任何修改）。"; exit 0; }
+  else
+    if [ "$PLAT_FAMILY" = "debian" ] && [ "${PLAT_VER:-}" != "24.04" ] && [ "${PLAT_ID:-}" = "ubuntu" ]; then
+      info "提示：本项目主要在 Ubuntu 24.04 上验证；您当前是 ${PLAT_NAME}，已按 Debian 系通用方式处理。"
+    fi
+  fi
+
+  if [ -z "$PKG" ]; then
+    warn "未识别包管理器：第 2/8 项的软件安装需要你手工完成（脚本会打印对应命令）。"
+  fi
+  if [ -z "$SSHD_BIN" ]; then
+    err "未找到 sshd 二进制：无法加固 SSH（本机可能没装 openssh-server）。"
+  fi
+  if [ "$INIT" = "none" ]; then
+    warn "未识别 init 系统：服务启停需要你手工执行（脚本会打印对应命令）。"
+  fi
+
+  info "[2/5] 公网 IP / 地区 / ASN（不通自动跳过，最多 8 秒）"
+  if need_cmd curl; then
+    curl -s --connect-timeout 4 --max-time 8 ipinfo.io || warn "ipinfo.io 不可达，已跳过。"
+  else
+    warn "未安装 curl，已跳过。可手动执行: curl -s ipinfo.io"
+  fi
+
+  info "[3/5] 网络地址"
+  run_timed 10 net_addrs 2>/dev/null | sed 's/^/  /' || warn "无 ip/ifconfig 可用"
+
+  info "[4/5] SSH 端口与监听端口（最多 10 秒）"
+  info "  检测到的 SSH 端口: $(all_ssh_ports | tr '\n' ' ')"
+  run_timed 10 net_listen 2>/dev/null | sed 's/^/  /' || warn "无 ss/netstat 可用"
+
+  info "[5/5] 需要你手动完成的事项"
+  warn "请现在就在服务商后台实际登录一次 Console / VNC，并确认快照与云防火墙入口存在。"
+  ok "预检完成。"
+}
+
+#------------------------------ 第 2 项：系统更新 ------------------------------#
+
+step2_update() {
+  hdr "第 2 项：更新系统安全补丁"
+  if [ -z "$PKG" ]; then
+    warn "未识别包管理器，请手工更新系统后继续。"
+    return 1
+  fi
+  info "使用包管理器: $PKG（先刷新索引，再升级；可能需要几分钟）"
+  pkg_update || warn "刷新索引返回非 0（部分发行版允许），继续尝试升级……"
+  if [ "$PKG" = "emerge" ]; then
+    warn "Gentoo 全量升级耗时可能很长，且可能触发配置合并（etc-update）。"
+    confirm "确认现在执行 emerge -uDN @world ？" || { info "已跳过系统升级，请稍后手工执行: emerge -uDN @world"; return 0; }
+  fi
+  pkg_upgrade_all || { err "系统升级失败，请手工处理后重试。"; return 1; }
+  ok "系统软件包已更新。"
+
+  local rr
+  rr=$(reboot_required)
+  case "$rr" in
+    yes)
+      warn "检测到需要重启（依据本发行版的判定方式）。"
+      if confirm "现在重启？(重启后重新运行本脚本继续)"; then
+        info "重启中……重启后重新运行: sudo bash $0 --auto"
+        if [ "$INIT" = "systemd" ]; then systemctl reboot; else reboot; fi
+        exit 0
+      else
+        warn "已选择暂不重启：部分内核/库补丁要重启后才生效。"
+      fi ;;
+    no) ok "当前无需重启。" ;;
+    *)  info "无法自动判定是否需要重启，请自行确认（部分平台无对应机制）。" ;;
+  esac
+
+  info "配置自动安全更新……"
+  if auto_updates_setup; then
+    ok "已配置自动安全更新。"
+  else
+    warn "本平台未自动配置自动安全更新。"
+    auto_updates_manual_hint
+  fi
+  info "注意：3X-UI / Xray 等业务程序的大版本升级，仍建议先备份 → 再升级 → 再验证。"
+  info "顺带提醒：自动安全更新只覆盖系统补丁，不覆盖业务程序。"
+}
+
+#------------------------------ 第 3 项：普通 sudo 用户 ------------------------------#
+
 step3_user() {
-  hdr "第 3 项：创建普通 sudo 管理用户"
+  hdr "第 3 项：创建普通管理员用户"
   local NEW_USER=""
+  if ! need_cmd useradd && ! need_cmd pw; then
+    err "系统缺少 useradd/pw，请手工创建用户后继续。"
+    return 1
+  fi
   while :; do
     ask "输入要创建的管理员用户名(小写字母/数字，如 alex):" NEW_USER || return 1
     if printf '%s' "$NEW_USER" | grep -qE '^[a-z_][a-z0-9_-]*$'; then break; fi
     err "用户名不合法，只能用小写字母、数字、下划线、连字符。"
   done
+  if [ "$NEW_USER" = "root" ]; then
+    err "不要使用 root：后续会写入 PermitRootLogin no，会导致无法登录。"
+    return 1
+  fi
 
-  if id "$NEW_USER" >/dev/null 2>&1; then
-    warn "用户 $NEW_USER 已存在，跳过创建，仅确保 sudo 权限与 shell。"
+  if user_exists "$NEW_USER"; then
+    warn "用户 $NEW_USER 已存在，跳过创建（密码可在第 4 项设置）。"
   else
-    useradd -m -s /bin/bash "$NEW_USER" || { err "创建用户失败"; return 1; }
-    info "为 $NEW_USER 设置登录密码（输入不会显示，输两遍一致即可）:"
-    passwd "$NEW_USER" || { err "设置密码失败"; return 1; }
+    create_admin_user "$NEW_USER" || { err "创建用户失败"; return 1; }
     ok "用户 $NEW_USER 已创建。"
   fi
-  usermod -aG sudo "$NEW_USER"
-  usermod -s /bin/bash "$NEW_USER"
-  chown "$NEW_USER:$(id -gn "$NEW_USER")" "/home/$NEW_USER" || true
+  add_to_admin_group "$NEW_USER"
+
+  if ! need_cmd sudo; then
+    info "未安装 sudo，尝试安装……"
+    if pkg_install sudo; then ok "sudo 已安装。"; else
+      warn "sudo 安装失败，请手工安装（$PKG install sudo）。"
+    fi
+  fi
+  if need_cmd sudo; then
+    grant_sudo_via_sudoers "$NEW_USER" && ok "已写入 sudoers 授权: /etc/sudoers.d/10-vps-hardening-$NEW_USER" \
+      || warn "sudoers 授权失败，请手工确认 $NEW_USER 有 sudo 权限。"
+  fi
+
   info "检查: $(id "$NEW_USER" 2>&1 | sed 's/^/  /')"
-  info "sudo 组包含: $(id -nG "$NEW_USER" | sed 's/^/  /')"
   ok "第 3 项完成。"
-  # 记录当前用户到 root 专属文件(0600)，供第 4/5 项引用并二次确认，避免误用其它用户
   printf 'NEW_USER=%s\n' "$NEW_USER" > "$CTX_FILE" 2>/dev/null
   chmod 600 "$CTX_FILE" 2>/dev/null || true
 }
 
-#---------------------------- 第 4 项：安装 SSH Key ----------------------------#
-step4_sshkey() {
-  hdr "第 4 项：把 SSH Key 公钥安装到普通用户"
+#------------------------------ 第 4 项：登录通道 ------------------------------#
+
+step4_password() {
+  hdr "第 4 项（密码模式）：设置强密码并验证密码登录"
+  GEN_PW_SAVE=""
   local NEW_USER=""
   pick_user || return 1
-  id "$NEW_USER" >/dev/null 2>&1 || { err "用户 $NEW_USER 不存在，请先执行第 3 项。"; return 1; }
+  user_exists "$NEW_USER" || { err "用户 $NEW_USER 不存在，请先执行第 3 项。"; return 1; }
 
-  local keydir="/home/$NEW_USER/.ssh"
-  local keyfile="$keydir/authorized_keys"
+  # 只读地查看当前生效值，不触发任何配置改动（ssh_conf_prepare 会注入 Include，放到第 5 项再做）
+  info "当前 sshd 密码相关生效值:"
+  if [ "$SSHD_T_OK" = "1" ]; then
+    "$SSHD_BIN" -T 2>/dev/null | grep -Ei '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|maxauthtries|port) ' | sed 's/^/  /'
+  else
+    grep -Ei '^[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|MaxAuthTries|Port)' /etc/ssh/sshd_config 2>/dev/null | sed 's/^/  /'
+  fi
+
+  local mode=""
+  ask "密码设置方式: [1] 自动生成 32 位随机密码(推荐)  [2] 手动输入（默认 1）:" mode || mode=1
+  case "$mode" in
+    2)
+      info "请为 $NEW_USER 设置密码:"
+      passwd "$NEW_USER" || { err "设置密码失败"; return 1; } ;;
+    *)
+      [ -t 0 ] || { err "非交互终端，无法确认随机密码已保存，已中止。请选择 [2] 手动输入。"; return 1; }
+      local GENPW=""
+      if need_cmd openssl; then GENPW=$(openssl rand -hex 16)
+      else GENPW=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32); fi
+      [ -n "$GENPW" ] || { err "生成密码失败，请改用手动输入。"; return 1; }
+      printf '%b' "\n${C_BLD}${C_GRN}  即将为 $NEW_USER 设置的密码: $GENPW${C_N}\n\n"
+      warn "该密码只显示这一次，脚本不写入任何文件。"
+      if ! confirm "已把该密码保存到密码管理器？(未保存将中止)"; then
+        printf '%b' "\n${C_BLD}${C_GRN}  再显示一次: $GENPW${C_N}\n\n"
+        confirm "现在已保存？(仍选 N 将中止)" || { err "已中止，密码未修改。"; return 1; }
+      fi
+      if need_cmd chpasswd; then
+        printf '%s:%s\n' "$NEW_USER" "$GENPW" | chpasswd || { err "设置密码失败"; return 1; }
+      else
+        err "缺少 chpasswd，请手动执行 passwd $NEW_USER 设置上面显示的密码。"
+        return 1
+      fi
+      GEN_PW_SAVE="$GENPW"
+      ok "密码已设置。" ;;
+  esac
+
+  # 闸门：密码必须可用
+  password_status "$NEW_USER"
+  case $? in
+    0) ok "该账户已设置可用密码。" ;;
+    1) err "账户没有可用密码（锁定/无密码），密码登录必定失败，已中止。"; return 1 ;;
+    *) warn "无法自动判定密码状态，请自行确认。"; confirm "仍要继续？" || return 1 ;;
+  esac
+
+  # 附加检查：登录 shell、账户有效期（能查则查）
+  local sh
+  sh=$(user_shell "$NEW_USER")
+  case "$sh" in
+    */nologin|*/false|'') err "登录 shell 是 '${sh:-空}'，无法密码登录，已中止。"; return 1 ;;
+    *) info "登录 shell: $sh" ;;
+  esac
+  if need_cmd chage; then
+    info "账户有效期 (chage -l):"
+    chage -l "$NEW_USER" 2>/dev/null | sed 's/^/  /' || true
+  fi
+
+  printf 'NEW_USER=%s\n' "$NEW_USER" > "$CTX_FILE" 2>/dev/null
+  chmod 600 "$CTX_FILE" 2>/dev/null || true
+
+  ok "请在【第二个终端窗口】用【用户名 + 密码】登录验证（本窗口不要关闭！）:"
+  echo "  ssh $NEW_USER@<你的服务器IP>"
+  warn "第 5 项会关闭 root 的 SSH 登录，必须先确认这个普通账户能用密码登录。"
+  confirm "第二个窗口已用【用户名+密码】成功登录？(未验证请选 N 中止)" || { err "已中止：请先完成密码登录验证。"; return 1; }
+  ok "第 4 项完成。"
+}
+
+step4_sshkey() {
+  hdr "第 4 项（Key 模式）：安装 SSH 公钥并验证"
+  local NEW_USER=""
+  pick_user || return 1
+  user_exists "$NEW_USER" || { err "用户 $NEW_USER 不存在，请先执行第 3 项。"; return 1; }
+
+  local homedir=""
+  if need_cmd getent; then homedir=$(getent passwd "$NEW_USER" | awk -F: '{print $6}')
+  else homedir=$(awk -F: -v u="$NEW_USER" '$1==u{print $6}' /etc/passwd); fi
+  [ -n "$homedir" ] || homedir="/home/$NEW_USER"
+  local keydir="$homedir/.ssh" keyfile="$homedir/.ssh/authorized_keys"
   mkdir -p "$keydir" && chmod 700 "$keydir"
 
   local PUBKEY=""
-  ask "请把【本机】生成的公钥【完整一行】粘贴到这里（ssh-ed25519 / ssh-rsa / ecdsa-sha2 开头，粘贴后回车即可）:" PUBKEY || return 1
-  PUBKEY=${PUBKEY%$'\r'}   # 去掉 Windows 粘贴可能带来的结尾 \r
+  ask "请把【本机】生成的公钥【完整一行】粘贴到这里（ssh-ed25519 / ssh-rsa / ecdsa-sha2 开头）:" PUBKEY || return 1
+  PUBKEY=${PUBKEY%$'\r'}
   case "$PUBKEY" in
-    '')
-      err "公钥为空。若已在教程 4.3 手动粘贴过公钥，可直接选择第 5 项继续。"
-      return 1 ;;
+    '') err "公钥为空。若已手工配置过公钥，可直接跳到第 5 项。"; return 1 ;;
     ssh-ed25519\ AAAA*|ssh-rsa\ AAAA*|ecdsa-sha2-*\ AAAA*|sk-*\ AAAA*) : ;;
-    *)
-      err "输入内容不是有效的 OpenSSH 公钥行（应为: 类型 AAAA... [注释]）。为避免向 authorized_keys 写入垃圾内容，已中止。"
-      return 1 ;;
+    *)  err "不是有效的 OpenSSH 公钥行（应形如: 类型 AAAA... [注释]），已中止。"; return 1 ;;
   esac
   case "$PUBKEY" in
-    ssh-rsa\ *)
-      warn "提示：Ubuntu 24.04 的 OpenSSH 9.6 默认拒绝老式 ssh-rsa(SHA-1) 签名，RSA 公钥需客户端支持 rsa-sha2 才能通过后续验证。" ;;
+    ssh-rsa\ *) warn "提示：新版 OpenSSH（>=8.8）默认拒绝老式 ssh-rsa(SHA-1) 签名，RSA 密钥需客户端支持 rsa-sha2。" ;;
   esac
 
   touch "$keyfile" && chmod 600 "$keyfile"
@@ -284,391 +461,632 @@ step4_sshkey() {
     ok "公钥已写入 $keyfile"
   fi
   chmod 700 "$keydir"; chmod 600 "$keyfile"
-  chown -R "$NEW_USER:$(id -gn "$NEW_USER")" "$keydir"
-  chmod 755 "/home/$NEW_USER" 2>/dev/null || true
+  local grp=""
+  if need_cmd id; then grp=$(id -gn "$NEW_USER" 2>/dev/null); fi
+  [ -n "$grp" ] && chown -R "$NEW_USER:$grp" "$keydir" 2>/dev/null || true
   ls -la "$keydir" | sed 's/^/  /'
 
-  ok "公钥安装完成。请立即验证（本窗口不要关闭！）:"
-  printf '%b' "${C_BLD}  验证步骤:${C_N}\n"
-  echo "  1) 打开电脑上【第二个终端窗口】执行:  ssh $NEW_USER@<你的服务器IP>"
-  echo "  2) 登录后执行 whoami ，应返回 $NEW_USER"
-  echo "  3) 再执行 sudo whoami ，应返回 root"
-  warn "在第二个窗口验证 SSH Key 能正常登录之前，绝对不要继续下一步（会关闭密码登录）。"
-  confirm "第二个窗口已用 SSH Key 成功登录？(未验证请选 N 中止)" || { err "请先完成新窗口验证再回来重跑第 5 项。"; return 1; }
-  # 验证通过后把用户名写入 root 专属上下文，供第 5 项引用同一用户
+  ok "请在【第二个终端窗口】验证（本窗口不要关闭！）:"
+  echo "  ssh $NEW_USER@<你的服务器IP>    → 登录后 whoami 应返回 $NEW_USER，sudo whoami 应返回 root"
+  warn "在第二个窗口验证成功前，绝对不要继续第 5 项。"
+  confirm "第二个窗口已用 SSH Key 成功登录？(未验证请选 N 中止)" || { err "已中止：请先完成新窗口验证。"; return 1; }
   printf 'NEW_USER=%s\n' "$NEW_USER" > "$CTX_FILE" 2>/dev/null
   chmod 600 "$CTX_FILE" 2>/dev/null || true
   ok "第 4 项完成。"
 }
 
-#---------------------------- 第 5 项：关闭 root 与密码登录 ----------------------------#
-step5_sshd() {
-  hdr "第 5 项：关闭 root 直接 SSH 登录 + 关闭密码登录"
-  local NEW_USER=""
-  pick_user || return 1
-  id "$NEW_USER" >/dev/null 2>&1 || { err "用户 $NEW_USER 不存在，请先执行第 3、4 项。"; return 1; }
+#------------------------------ 第 5 项：SSH 加固 ------------------------------#
 
-  # 安全闸门：没有 authorized_keys 时禁止继续，防止把自己锁在门外
-  if [ ! -s "/home/$NEW_USER/.ssh/authorized_keys" ]; then
-    err "未在 $NEW_USER 的 authorized_keys 中找到公钥，禁止关闭密码登录（教程原则：先验证再关闭）。"
-    return 1
-  fi
-  if [ "${FORCE:-0}" != "1" ] && ! confirm "再次确认：将针对用户 $NEW_USER 关闭 root/密码登录，且其 SSH Key 已在【新窗口】验证通过？"; then
-    err "已中止。请先完成新窗口验证。"; return 1
-  fi
-
-  local conf=/etc/ssh/sshd_config.d/00-vps-hardening.conf
-  mkdir -p /etc/ssh/sshd_config.d
-  cat > "$conf" <<EOF
-# 由 vps-hardening.sh 生成，对应教程第 5 项
+build_ssh_block() {
+  local user="$1"
+  if [ "$MODE" = "password" ]; then
+    cat <<EOF
+# 由 vps-hardening 生成（密码登录模式）
 PermitRootLogin no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
+PasswordAuthentication yes
+${SSH_KBD_KEY} no
 PubkeyAuthentication yes
-AllowUsers $NEW_USER
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 60
+AllowUsers $user
 X11Forwarding no
 EOF
-  ok "已写入 $conf :"
-  sed 's/^/  /' "$conf"
+  else
+    cat <<EOF
+# 由 vps-hardening 生成（SSH Key 模式）
+PermitRootLogin no
+PasswordAuthentication no
+${SSH_KBD_KEY} no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+AllowUsers $user
+X11Forwarding no
+EOF
+  fi
+}
+
+write_ssh_conf() {
+  local conf="$1" user="$2" tmp block
+  if [ "$SSH_CONF_MODE" = "dropin" ]; then
+    tmp=$(mktemp) || return 1
+    build_ssh_block "$user" > "$tmp" && cat "$tmp" > "$conf" && rm -f "$tmp"
+    return $?
+  fi
+  # 直改模式：注释冲突项 + 在第一个 Match 之前插入/替换我们带标记的块
+  ssh_direct_comment_conflicts "$conf" || return 1
+  local marker_b="vps-hardening begin" marker_e="vps-hardening end"
+  tmp=$(mktemp) || return 1
+  block=$(mktemp) || { rm -f "$tmp"; return 1; }
+  { echo ""; echo "# ===== ${marker_b} ====="; build_ssh_block "$user"; echo "# ===== ${marker_e} ====="; } > "$block"
+  # 先删除旧块（幂等）
+  awk -v b="$marker_b" -v e="$marker_e" '
+    index($0,b) {skip=1}
+    skip!=1 {print}
+    index($0,e) {skip=0}
+  ' "$conf" > "$tmp" && cat "$tmp" > "$conf" || { rm -f "$tmp" "$block"; return 1; }
+  # 插入到第一个 Match 之前；没有 Match 则追加到末尾（Match 段会“吞掉”后面所有指令）
+  awk -v bf="$block" '
+    BEGIN { while ((getline l < bf) > 0) blk = blk l "\n" }
+    !done && /^[[:space:]]*Match[[:space:]]/ { printf "%s", blk; done=1 }
+    { print }
+    END { if (!done) printf "%s", blk }
+  ' "$conf" > "$tmp" && cat "$tmp" > "$conf"
+  local rc=$?
+  rm -f "$tmp" "$block"
+  return $rc
+}
+
+step5_sshd() {
+  if [ "$MODE" = "password" ]; then
+    hdr "第 5 项：关闭 root 登录 + 加固密码登录"
+  else
+    hdr "第 5 项：关闭 root 登录 + 关闭密码认证"
+  fi
+  [ -n "$SSHD_BIN" ] || { err "未找到 sshd，无法继续。"; return 1; }
+  local NEW_USER=""
+  pick_user || return 1
+  user_exists "$NEW_USER" || { err "用户 $NEW_USER 不存在，请先执行第 3、4 项。"; return 1; }
+
+  # 闸门 1：登录通道必须已经可用
+  if [ "$MODE" = "password" ]; then
+    password_status "$NEW_USER"
+    case $? in
+      0) : ;;
+      1) err "用户 $NEW_USER 没有可用密码，禁止继续（否则关闭 root 登录后会锁死）。请先执行第 4 项。"; return 1 ;;
+      2) warn "无法自动判定密码状态（本平台不支持 passwd -S，且 shadow 记录不可读）。"
+         confirm "你已经确认过该账户可以用密码登录？" || { err "已中止。"; return 1; } ;;
+    esac
+  else
+    local homedir=""
+    if need_cmd getent; then homedir=$(getent passwd "$NEW_USER" | awk -F: '{print $6}'); else homedir="/home/$NEW_USER"; fi
+    [ -s "$homedir/.ssh/authorized_keys" ] || { err "未找到 $NEW_USER 的公钥，禁止关闭密码登录。请先执行第 4 项。"; return 1; }
+  fi
+  # 闸门 2：人工确认新窗口验证过
+  if [ "${FORCE:-0}" != "1" ]; then
+    if [ "$MODE" = "password" ]; then
+      confirm "再次确认：$NEW_USER 已在【新窗口】用密码登录成功？" || { err "已中止。"; return 1; }
+    else
+      confirm "再次确认：$NEW_USER 已在【新窗口】用 SSH Key 登录成功？" || { err "已中止。"; return 1; }
+    fi
+  fi
+
+  ssh_conf_prepare || { err "无法安全地管理 sshd 配置，已中止。"; return 1; }
+  info "将写入: $SSH_CONF （模式: $SSH_CONF_MODE）"
+  if ! write_ssh_conf "$SSH_CONF" "$NEW_USER"; then
+    err "写入配置失败，已中止。"
+    abort_conf "$SSH_CONF"
+    return 1
+  fi
+  sed 's/^/  /' "$SSH_CONF" | tail -n 20
 
   info "检查配置语法 (sshd -t)……"
-  if ! sshd -t; then
-    err "sshd 配置语法错误，已中止（不会重启 SSH）。"
-    abort_conf "$conf"
-    return 1
+  if ! sshd_test; then
+    if printf '%s' "${SSHD_TEST_OUT:-}" | grep -qi 'bad configuration option'; then
+      warn "当前 OpenSSH 不认识 ${SSH_KBD_KEY}，改用旧关键字重试……"
+      if [ "$SSH_KBD_KEY" = "KbdInteractiveAuthentication" ]; then
+        SSH_KBD_KEY=ChallengeResponseAuthentication
+      else
+        SSH_KBD_KEY=KbdInteractiveAuthentication
+      fi
+      write_ssh_conf "$SSH_CONF" "$NEW_USER" || { err "写入配置失败。"; abort_conf "$SSH_CONF"; return 1; }
+      if ! sshd_test; then
+        err "sshd 配置语法仍不正确，已中止（不会重启 SSH）："
+        printf '%s\n' "${SSHD_TEST_OUT:-}" | sed 's/^/  /'
+        abort_conf "$SSH_CONF"
+        return 1
+      fi
+      ok "已改用 ${SSH_KBD_KEY} 并通过语法检查。"
+    else
+      err "sshd 配置语法错误，已中止（不会重启 SSH）："
+      printf '%s\n' "${SSHD_TEST_OUT:-}" | sed 's/^/  /'
+      abort_conf "$SSH_CONF"
+      return 1
+    fi
   fi
 
-  info "最终生效值检查 (sshd -T):"
-  sshd -T | grep -E 'permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|x11forwarding|allowusers' | sed 's/^/  /'
+  info "生效值检查:"
+  sshd_effective_dump | grep -Ei '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyauthentication|permitemptypasswords|maxauthtries|logingracetime|allowusers|x11forwarding) ' | sed 's/^/  /' || true
+
+  # 老版本 OpenSSH 无法用 -T 校验时，先扫描是否有更早生效的配置会覆盖我们
+  if ! ssh_conf_conflict_scan; then
+    err "存在会覆盖加固设置的更早配置，已中止（不会重启 SSH）。"
+    abort_conf "$SSH_CONF"
+    return 1
+  fi
 
   local fail=0
-  sshd -T | grep -q '^permitrootlogin no$' || { err "permitrootlogin 不是 no"; fail=1; }
-  sshd -T | grep -q '^passwordauthentication no$' || { err "passwordauthentication 不是 no"; fail=1; }
-  sshd -T | grep -q '^kbdinteractiveauthentication no$' || { err "kbdinteractiveauthentication 不是 no"; fail=1; }
-  sshd -T | grep -q '^pubkeyauthentication yes$' || { err "pubkeyauthentication 不是 yes"; fail=1; }
-  sshd -T | grep -q '^x11forwarding no$' || { err "x11forwarding 不是 no"; fail=1; }
-  # AllowUsers 按词精确匹配（顺序无关，也避免把“allowusers alex bob”这类多用户误判为通过）
-  if ! sshd -T | awk -v u="$NEW_USER" '$1=="allowusers"{for(i=2;i<=NF;i++) if($i==u) f=1} END{exit !f}'; then
-    err "AllowUsers 未包含 $NEW_USER"; fail=1
+  ssh_effective_is permitrootlogin no || { err "PermitRootLogin 未生效为 no"; fail=1; }
+  ssh_effective_is pubkeyauthentication yes || { err "PubkeyAuthentication 未生效为 yes"; fail=1; }
+  # 关键：PasswordAuthentication no 并不足以关闭密码登录（UsePAM 下键盘交互仍可能是密码）
+  ssh_effective_is "${SSH_KBD_KEY,,}" no || { err "${SSH_KBD_KEY} 未生效为 no（UsePAM 下仍可能用密码登录）"; fail=1; }
+  ssh_effective_is x11forwarding no || { err "X11Forwarding 未生效为 no"; fail=1; }
+  if [ "$MODE" = "password" ]; then
+    ssh_effective_is passwordauthentication yes || { err "PasswordAuthentication 未生效为 yes（密码模式必须保留）"; fail=1; }
+    ssh_effective_is maxauthtries 3 || { err "MaxAuthTries 未生效为 3"; fail=1; }
+  else
+    ssh_effective_is passwordauthentication no || { err "PasswordAuthentication 未生效为 no"; fail=1; }
   fi
+  if ! ssh_effective_has_user "$NEW_USER"; then err "AllowUsers 未包含 $NEW_USER"; fail=1; fi
   if [ "$fail" = "1" ]; then
     err "生效配置与预期不符，已中止（不会重启 SSH）。"
-    abort_conf "$conf"
+    abort_conf "$SSH_CONF"
     return 1
   fi
 
-  # Ubuntu 24.04 默认 ssh.socket(socket 激活)：先 daemon-reload，
-  # 只重启“已启用”的监听单元，最后用端口监听状态验证（不用 is-active ssh 判断）
-  warn "即将应用新 SSH 配置。Ubuntu 24.04 默认 socket 激活；若是传统 sshd 模式，重启服务可能影响当前连接，请确保厂商 Console 可用。"
+  warn "即将应用新 SSH 配置（$SSH_CONF_MODE 模式）。如果是传统 sshd 模式，重启可能短暂影响当前连接，请确保厂商 Console 可用。"
   confirm "确认应用？" || {
-    abort_conf "$conf"
-    err "已取消并撤下该配置。可稍后手动执行: systemctl daemon-reload && systemctl try-restart ssh ssh.socket"
+    abort_conf "$SSH_CONF"
+    err "已取消并撤下该配置。"
     return 1
   }
 
-  systemctl daemon-reload
-  local unit=""
-  if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-    systemctl restart ssh.socket 2>/dev/null && unit="ssh.socket"
+  local ports
+  ports=$(all_ssh_ports)
+  if ssh_apply_and_verify "$ports"; then
+    ok "第 5 项完成。请在【新窗口】验证："
+    if [ "$MODE" = "password" ]; then
+      echo "  1) ssh $NEW_USER@<你的服务器IP>   → 输入密码应能登录"
+    else
+      echo "  1) ssh $NEW_USER@<你的服务器IP>   → 用 Key 应能登录"
+    fi
+    echo "  2) ssh root@<你的服务器IP>        → 应被拒绝"
+    info "以后新增管理员时，记得同步把用户名加入 AllowUsers（在 $SSH_CONF 中）。"
+    [ -n "${GEN_PW_SAVE:-}" ] && printf '%b' "${C_BLD}${C_GRN}  再次提醒：$NEW_USER 的密码是 $GEN_PW_SAVE${C_N}\n"
+    return 0
   fi
-  if [ -z "$unit" ] || systemctl is-enabled --quiet ssh.service 2>/dev/null; then
-    systemctl try-restart ssh.service >/dev/null 2>&1 || true
-    [ -z "$unit" ] && unit="ssh.service"
-  fi
-  if [ -z "$unit" ]; then
-    systemctl restart ssh.service >/dev/null 2>&1 && unit="ssh.service"
-  fi
-  sleep 2
-
-  # 端口监听校验：覆盖 sshd 配置与 ssh.socket 的所有监听端口
-  local SSH_PORTS listening=0 p
-  SSH_PORTS=$(all_ssh_ports)
-  [ -n "$SSH_PORTS" ] || SSH_PORTS=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -n1)
-  for p in $SSH_PORTS; do
-    if ss -ltn | grep -Eq ":${p}[[:space:]]"; then listening=1; fi
-  done
-  if [ "$listening" = "1" ]; then
-    ok "配置已应用：${unit:-ssh} 正在监听端口 $(printf '%s' "$SSH_PORTS" | tr '\n' ' ')。"
-  else
-    err "未检测到 SSH 端口在监听！请勿断开当前连接，立即用厂商 Console 检查: journalctl -u ssh --no-pager | tail -n 20"
-    abort_conf "$conf"
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl try-restart ssh.service >/dev/null 2>&1 || true
-    warn "已撤下新配置并尝试恢复原配置，请在 Console 中确认 SSH 恢复后再重试。"
-    return 1
-  fi
-
-  ok "第 5 项完成。请在【新窗口】验证："
-  echo "  1) ssh $NEW_USER@<你的服务器IP>       → 应能正常登录"
-  echo "  2) ssh root@<你的服务器IP>            → 应被拒绝"
-  info "以后新增管理员时，记得同步把用户名加入 AllowUsers，否则公钥正确也登录不了。"
+  abort_conf "$SSH_CONF"
+  warn "已撤下新配置并尝试恢复；请在 Console 中确认 SSH 可用后再重试。"
+  ssh_recover_after_failure || warn "自动恢复未成功，请按上面的提示用厂商 Console 处理。"
+  return 1
 }
 
-#---------------------------- 第 6 项：UFW 防火墙 ----------------------------#
-step6_ufw() {
-  hdr "第 6 项：配置 UFW，只开放必要端口"
-  if ! dpkg -s ufw >/dev/null 2>&1; then
-    info "安装 ufw ……"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y ufw || { err "安装 ufw 失败"; return 1; }
+#------------------------------ 第 6 项：防火墙 ------------------------------#
+
+step6_firewall() {
+  hdr "第 6 项：配置防火墙，只开放必要端口"
+  fw_detect
+  info "防火墙后端: $FW_BACKEND  ($FW_WHY)"
+  case "$FW_BACKEND" in
+    none|"")
+      fw_manual_note
+      warn "第 6 项未自动完成：防火墙尚未配置，请按上面的手工命令处理后再继续。"
+      return 1 ;;
+    manual)
+      fw_manual_note
+      warn "第 6 项需要手工完成（脚本不会改写 pf/nft 全局规则集）。"
+      return 1 ;;
+  esac
+
+  # firewalld 的 firewall-cmd 依赖守护进程，必须在加规则之前把它启动起来
+  if [ "$FW_BACKEND" = "firewalld" ] && ! fw_is_active; then
+    info "firewalld 尚未运行，先启动它（firewall-cmd 需要守护进程在线）……"
+    if ! svc_enable_now firewalld >/dev/null 2>&1; then
+      err "firewalld 启动失败，请手工处理（systemctl enable --now firewalld）后重试。"
+      return 1
+    fi
+    sleep 2
+    fw_is_active || { err "firewalld 仍未处于运行状态，已中止。"; return 1; }
   fi
 
-  local SSH_PORTS
-  SSH_PORTS=$(all_ssh_ports)
-  [ -n "$SSH_PORTS" ] || SSH_PORTS=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -n1)
-  case "$SSH_PORTS" in
-    ''|*[!0-9[:space:]]*) err "无法确定有效的 SSH 端口（得到: '$SSH_PORTS'），已中止。"; return 1 ;;
+  # 安装防火墙工具（若需要）
+  case "$FW_BACKEND" in
+    ufw)
+      if ! need_cmd ufw; then
+        info "安装 ufw ……"
+        pkg_install ufw || { err "ufw 安装失败，请手工安装后重试。"; fw_manual_note; return 1; }
+      fi ;;
+    firewalld)
+      if ! need_cmd firewall-cmd; then
+        info "安装 firewalld ……"
+        pkg_install firewalld || { err "firewalld 安装失败。"; return 1; }
+        svc_enable_now firewalld >/dev/null 2>&1 || true
+        sleep 2
+      fi ;;
   esac
-  local SESS_PORT p
+
+  local SSH_PORTS SESS_PORT p
+  SSH_PORTS=$(all_ssh_ports)
   SESS_PORT=$(current_session_port)
-  info "检测到的 SSH 监听端口: $(printf '%s' "$SSH_PORTS" | tr '\n' ' ')"
+  if [ -z "$SSH_PORTS" ] && [ -z "$SESS_PORT" ]; then
+    err "无法确定 SSH 端口（sshd -T、socket 单元、配置文件都没给出端口，也没有可用的会话端口）。"
+    err "为避免开启默认拒绝后失联，已中止。请手工运行 'sshd -T | grep -i \"^port\"' 确认真实端口后重试。"
+    return 1
+  fi
+  [ -n "$SSH_PORTS" ] || { warn "未能自动检测端口，使用当前会话端口 $SESS_PORT。"; SSH_PORTS="$SESS_PORT"; }
+  case "$SSH_PORTS" in
+    ''|*[!0-9[:space:]]*) err "无法确定 SSH 端口（得到: '$SSH_PORTS'），已中止。"; return 1 ;;
+  esac
+  info "SSH 端口: $(printf '%s' "$SSH_PORTS" | tr '\n' ' ')"
   [ -n "$SESS_PORT" ] && info "当前会话的服务端端口: $SESS_PORT"
 
-  # 顺序：先允许 SSH、确认规则已加入，再开启 UFW（不要反过来）
-  for p in $SSH_PORTS; do ufw allow "$p/tcp"; done
-  # 会话端口必须被覆盖，否则断线重连时会被默认拒绝挡在门外
+  # 先放行 SSH（包含会话端口），确认规则存在后再开启防火墙
+  for p in $SSH_PORTS; do fw_allow_port "$p" tcp || warn "放行 $p/tcp 失败"; done
   if [ -n "$SESS_PORT" ] && ! printf '%s\n' "$SSH_PORTS" | grep -qx "$SESS_PORT"; then
-    warn "当前会话端口 $SESS_PORT 不在监听列表内，已单独放行以防断线后失联。"
-    ufw allow "${SESS_PORT}/tcp"
+    warn "当前会话端口 $SESS_PORT 不在检测到的列表内，已单独放行。"
+    fw_allow_port "$SESS_PORT" tcp >/dev/null 2>&1 || true
     SSH_PORTS=$(printf '%s\n%s\n' "$SSH_PORTS" "$SESS_PORT" | sort -un)
   fi
   local rules_ok=1
-  for p in $SSH_PORTS; do
-    ufw show added 2>/dev/null | grep -q "^ufw allow ${p}/tcp" || rules_ok=0
-  done
+  for p in $SSH_PORTS; do fw_rule_has_port "$p" tcp || rules_ok=0; done
   if [ "$rules_ok" != "1" ]; then
-    err "SSH 端口放行规则未全部加入，已中止（避免开启默认拒绝后被锁在门外）。"
+    err "SSH 放行规则未全部生效，已中止（避免开启默认拒绝后被锁在门外）。"
+    info "请手工放行 SSH 后重试。当前规则："
+    fw_show 2>/dev/null | sed 's/^/  /' || true
     return 1
   fi
   ok "已确认放行 SSH: $(printf '%s' "$SSH_PORTS" | tr '\n' ' ')"
-  ufw default deny incoming
-  ufw default allow outgoing
 
-  if confirm "现在是否有需要放行的业务端口？(还没有装 3X-UI/Reality/Hysteria2 就选 N，以后用到再放)"; then
-    read -r -p "输入端口列表，空格分隔，例如: 443/tcp 443/udp 8080/tcp : " -a PORTS || { echo; return 1; }
-    for p in "${PORTS[@]:-}"; do
-      [ -z "$p" ] && continue
-      if ufw allow "$p" >/dev/null 2>&1; then
-        ok "已放行 $p"
-      else
-        warn "放行 $p 失败，请检查格式（如 443/tcp）"
-      fi
+  fw_defaults_deny_incoming || warn "设置默认策略时返回非 0，请手工确认默认拒绝入站。"
+
+  if confirm "现在是否有需要放行的业务端口？(还没装 3X-UI/Reality/Hysteria2 就选 N)"; then
+    local plist="" proto=""
+    ask "输入端口列表，空格分隔，例如: 443/tcp 443/udp 8080/tcp :" plist || plist=""
+    for p in $plist; do
+      proto=${p##*/}
+      case "$proto" in tcp|udp) : ;; *) proto=tcp ;; esac
+      p=${p%%/*}
+      printf '%s' "$p" | grep -qE '^[0-9]{1,5}$' || { warn "跳过非法端口: $p"; continue; }
+      fw_allow_port "$p" "$proto" >/dev/null 2>&1 && ok "已放行 $p/$proto" || warn "放行 $p/$proto 失败"
     done
   fi
 
-  # 允许 SSH 之后再 enable，防止把自己挡在门外
-  ufw --force enable
-  if ! ufw status | grep -q 'Status: active'; then
-    err "UFW 未进入 active 状态，请立即用厂商 Console 检查。"
+  info "启用/重载防火墙……"
+  fw_enable || { err "启用防火墙失败，请手工处理。"; return 1; }
+  if ! fw_is_active; then
+    err "防火墙未处于活动状态，请立即检查（避免误以为已防护）。"
     return 1
   fi
-  ok "UFW 已启用（默认拒绝入站，放行出站）"
+  ok "防火墙已启用。当前规则:"
+  fw_show 2>/dev/null | sed 's/^/  /' || true
+
   local missing=0
-  for p in $SSH_PORTS; do
-    ufw status | grep -Eq "^${p}/tcp" || missing=1
-  done
-  if [ -n "$SESS_PORT" ] && ! ufw status | grep -Eq "^${SESS_PORT}/tcp"; then missing=1; fi
+  for p in $SSH_PORTS; do fw_rule_has_port "$p" tcp || missing=1; done
   if [ "$missing" = "1" ]; then
     err "启用后未看到全部 SSH 放行规则！请立即用厂商 Console 检查。"
     return 1
   fi
-  ufw status numbered | sed 's/^/  /'
 
-  local ipv6
-  ipv6=$(grep '^IPV6=' /etc/default/ufw 2>/dev/null | tail -n1)
-  info "IPv6 设置: ${ipv6:-未找到 IPV6= 行}"
-  case "$ipv6" in
-    IPV6=yes) info "IPV6=yes，若服务器有 IPv6 请同步检查服务商 IPv6 云防火墙。" ;;
-    IPV6=no)  warn "IPV6=no：UFW 不管理 IPv6 流量，请确认服务器是否使用 IPv6，必要时手动改 /etc/default/ufw 为 IPV6=yes。" ;;
+  if [ "$MODE" = "password" ]; then
+    if confirm "是否把 SSH 限制为只允许你的固定管理 IP 访问？(动态 IP 请选 N)"; then
+      ssh_ip_whitelist "$SSH_PORTS" "$SESS_PORT" || warn "IP 白名单步骤未完成，已保留原有放行规则。"
+    fi
+  fi
+
+  # ufw 的 IPv6 支持需要单独确认（IPV6=no 时 v6 流量不受 UFW 管理）
+  if [ "$FW_BACKEND" = "ufw" ] && [ -r /etc/default/ufw ]; then
+    local ipv6
+    ipv6=$(grep '^IPV6=' /etc/default/ufw | tail -n1)
+    info "ufw IPv6 设置: ${ipv6:-未找到 IPV6= 行}"
+    case "$ipv6" in
+      IPV6=yes) info "IPV6=yes：若服务器有 IPv6，请同步检查服务商 IPv6 云防火墙。" ;;
+      IPV6=no)  warn "IPV6=no：UFW 不管理 IPv6 流量。若服务器启用了 IPv6，请把 /etc/default/ufw 改为 IPV6=yes 后 ufw reload。" ;;
+    esac
+  else
+    info "IPv6 提示：请确认防火墙与云端 IPv6 规则一致（不同后端对 IPv6 支持不同）。"
+  fi
+  case "$FW_BACKEND" in
+    iptables)
+      warn "iptables 后端只管理 IPv4 规则，且会把 FORWARD 默认策略设为 DROP（可能影响转发/NAT/容器网络）；如本机做路由转发请改用 ufw/firewalld。" ;;
   esac
-  warn "Docker 用户注意：Docker 的端口发布会绕过部分 UFW 规则，请用 docker ps 检查 PORTS 列；仅本机访问的服务建议绑定 127.0.0.1。"
+  warn "Docker 用户注意：Docker 会自行写 iptables，可能绕过主机防火墙；请用 docker ps 检查 PORTS 列，仅本机访问的服务绑定 127.0.0.1。"
   ok "第 6 项完成。"
 }
 
-#---------------------------- 第 7 项：检查所有监听端口（报告） ----------------------------#
-step7_listeners() {
-  hdr "第 7 项：检查所有监听端口（只读报告，不修改任何配置）"
-  info "当前监听端口与进程:"
-  run_timed 10 ss -lntup 2>/dev/null | sed 's/^/  /' || { err "ss 不可用或超时，请安装 iproute2"; return 1; }
-  echo
-  info "当前运行中的服务:"
-  systemctl --type=service --state=running 2>/dev/null | sed 's/^/  /'
-  echo
-  info "常见需确认的端口（不代表有问题，需确认程序/用途/是否需公网）:"
-  cat <<'EOF' | sed 's/^/  /'
-  21      FTP
-  23      Telnet
-  25      SMTP
-  3306    MySQL
-  5432    PostgreSQL
-  6379    Redis
-  2375    Docker API
-EOF
-  info "判断三要素：程序是否监听 + 防火墙是否允许 + 是否存在其它端口发布机制"
-  info "防火墙允许某端口 ≠ 一定有程序监听；有程序监听 ≠ 公网一定能访问。"
-  info "确认无用且明确了解的服务可执行: systemctl disable --now <服务名>（不要乱关 SSH/网络/DNS/Docker/Xray/3X-UI）"
+ssh_ip_whitelist() {
+  local SSH_PORTS="$1" SESS_PORT="${2:-}"
+  local TARGET_PORT ADMIN_IP="" CLIENT_IP="" answer=""
+  TARGET_PORT=${SESS_PORT:-$(printf '%s' "$SSH_PORTS" | head -n1)}
+
+  ask "要限制的 SSH 端口(默认 ${TARGET_PORT}):" answer || return 1
+  [ -n "$answer" ] && TARGET_PORT=$answer
+  printf '%s' "$TARGET_PORT" | grep -qE '^[0-9]{1,5}$' || { err "端口不合法，已跳过。"; return 1; }
+
+  ask "输入你固定的公网 IP:" ADMIN_IP || return 1
+  if valid_ipv4 "$ADMIN_IP"; then :; elif valid_ipv6 "$ADMIN_IP"; then :; else
+    err "IP 格式不正确，已跳过。"; return 1
+  fi
+
+  if [ -n "${SSH_CONNECTION:-}" ]; then CLIENT_IP=${SSH_CONNECTION%% *}
+  elif [ -n "${SSH_CLIENT:-}" ]; then CLIENT_IP=$(printf '%s' "$SSH_CLIENT" | awk '{print $1}'); fi
+  if [ -z "$CLIENT_IP" ]; then
+    warn "无法确定当前连接来源 IP，请自行确认 $ADMIN_IP 正确。"
+  elif [ "$CLIENT_IP" != "$ADMIN_IP" ]; then
+    warn "当前连接来源是 $CLIENT_IP，与白名单 $ADMIN_IP 不一致；填错会立刻失联。"
+    confirm "确认仍以 $ADMIN_IP 作为唯一允许来源？" || { info "已跳过。"; return 0; }
+  fi
+
+  fw_allow_from "$ADMIN_IP" "$TARGET_PORT" tcp || { err "添加白名单失败，未删除任何规则。"; return 1; }
+  ok "已添加白名单: $ADMIN_IP → ${TARGET_PORT}/tcp"
+
+  local revert_ok=0
+  if [ "$INIT" = "systemd" ] && need_cmd systemd-run && [ "$FW_BACKEND" = "ufw" ]; then
+    if systemd-run --on-active=10min --unit=ssh-fw-revert ufw allow "${TARGET_PORT}/tcp" >/dev/null 2>&1; then
+      revert_ok=1
+      warn "已安排 10 分钟自动回滚（万一失联会自动恢复全放行）。"
+    fi
+  fi
+  [ "$revert_ok" = "1" ] || warn "未安排自动回滚：若配置有误，只能通过厂商 Console 修复。"
+
+  confirm "确认删除 ${TARGET_PORT}/tcp 的全局放行规则（仅保留上面的白名单）？" || {
+    info "未删除全局规则。"; return 0; }
+
+  fw_delete_port "$TARGET_PORT" tcp >>/dev/null 2>&1
+  if fw_has_global_port "$TARGET_PORT" tcp; then
+    warn "仍检测到 ${TARGET_PORT}/tcp 的全局放行规则，请手工核对后删除。"
+  else
+    ok "已删除全局放行：SSH ${TARGET_PORT} 现在仅允许 $ADMIN_IP。"
+  fi
+  if [ "$revert_ok" = "1" ]; then
+    info "请立即用【新窗口】验证登录；成功后取消回滚："
+    echo "  sudo systemctl stop ssh-fw-revert.timer 2>/dev/null || sudo systemctl stop ssh-fw-revert"
+  else
+    info "请立即用【新窗口】验证登录，并保持厂商 Console 可用。"
+  fi
+  return 0
 }
 
-#---------------------------- 第 8 项：Fail2ban ----------------------------#
+#------------------------------ 第 7 项：监听端口检查 ------------------------------#
+
+step7_listeners() {
+  hdr "第 7 项：检查所有监听端口（只读）"
+  info "监听端口:"
+  run_timed 10 net_listen 2>/dev/null | sed 's/^/  /' || { err "无 ss/netstat/sockstat 可用"; return 1; }
+  echo
+  info "运行中的服务:"
+  svc_list_running 2>/dev/null | sed 's/^/  /' | head -n 40
+  echo
+  info "常见需确认的端口: 21 FTP / 23 Telnet / 25 SMTP / 3306 MySQL / 5432 PostgreSQL / 6379 Redis / 2375 Docker API"
+  info "判断三要素：程序是否监听 + 防火墙是否允许 + 是否有其它端口发布机制（如 Docker）。"
+  info "确认无用且了解用途后可用: sudo $(case "$INIT" in systemd) echo 'systemctl disable --now <服务>';; openrc) echo 'rc-update del <服务> && rc-service <服务> stop';; *) echo 'service <服务> stop';; esac) 停用。"
+}
+
+#------------------------------ 第 8 项：Fail2ban ------------------------------#
+
 step8_fail2ban() {
   hdr "第 8 项：安装并验证 Fail2ban"
-  if ! dpkg -s fail2ban >/dev/null 2>&1; then
+  if ! pkg_has fail2ban; then
     info "安装 fail2ban ……"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y fail2ban || { err "安装 fail2ban 失败"; return 1; }
+    pkg_install_fail2ban || {
+      err "fail2ban 安装失败。"
+      info "手工命令参考："
+      case "$PLAT_FAMILY" in
+        rhel) info "  sudo dnf install -y epel-release && sudo dnf install -y fail2ban" ;;
+        arch) info "  sudo pacman -S fail2ban" ;;
+        alpine) info "  sudo apk add fail2ban（需启用 community 仓库）" ;;
+        bsd) info "  sudo pkg install -y py311-fail2ban（FreeBSD）" ;;
+        *) info "  用你的包管理器安装 fail2ban" ;;
+      esac
+      return 1
+    }
   fi
+
+  local maxretry=3 findtime=10m bantime=2h label="推荐值" choice=""
+  if [ "$MODE" = "password" ]; then
+    ask "Fail2ban 强度: [1] 密码模式推荐 maxretry=3/findtime=10m/bantime=2h (默认)  [2] 宽松 maxretry=5/findtime=10m/bantime=1h（默认 1）:" choice || choice=1
+    case "$choice" in 2) maxretry=5; bantime=1h; label="宽松值" ;; esac
+  else
+    ask "Fail2ban 强度: [1] 默认 maxretry=5/findtime=10m/bantime=1h（默认 1）  [2] 严格 maxretry=3/findtime=10m/bantime=2h:" choice || choice=1
+    case "$choice" in
+      2) maxretry=3; bantime=2h; label="严格值" ;;
+      *) maxretry=5; bantime=1h; label="默认值" ;;
+    esac
+  fi
+
+  local IGNORE_LINE="" IGNORE_OPT=""
+  if confirm "是否把自己的固定管理 IP 加入 fail2ban 白名单(ignoreip)？"; then
+    ask "输入要加入白名单的 IP（多个用空格分隔，可留空跳过）:" IGNORE_LINE || IGNORE_LINE=""
+    [ -n "$IGNORE_LINE" ] && IGNORE_OPT="ignoreip = 127.0.0.1/8 ::1 $IGNORE_LINE"
+  fi
+
+  # backend：systemd 平台用 journald，其它平台交给 fail2ban 自动识别日志
+  local backend_opt=""
+  if [ "$INIT" = "systemd" ]; then backend_opt="backend = systemd"; else backend_opt="backend = auto"; fi
+
   mkdir -p /etc/fail2ban/jail.d
-  cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
+  cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
-backend = systemd
-maxretry = 5
-findtime = 10m
-bantime = 1h
+$backend_opt
+maxretry = $maxretry
+findtime = $findtime
+bantime = $bantime
+$IGNORE_OPT
 EOF
-  ok "已写入 /etc/fail2ban/jail.d/sshd.local（maxretry=5 / findtime=10m / bantime=1h）"
-  systemctl enable --now fail2ban >/dev/null 2>&1 || { err "启动 fail2ban 失败"; return 1; }
-  sleep 2
-  ok "fail2ban 服务状态:"
-  systemctl is-active fail2ban | sed 's/^/  /'
-  info "jail 列表:"
-  fail2ban-client status 2>/dev/null | sed 's/^/  /'
-  info "sshd jail 状态:"
-  fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'
+  ok "已写入 /etc/fail2ban/jail.d/sshd.local（$label: maxretry=$maxretry / findtime=$findtime / bantime=$bantime，$backend_opt）"
+
+  if svc_enable_now fail2ban >/dev/null 2>&1; then
+    sleep 2
+    ok "fail2ban 已启动。"
+  else
+    warn "fail2ban 服务启动失败（$INIT 平台请手工检查）。"
+  fi
+  if need_cmd fail2ban-client; then
+    info "jail 状态:"
+    fail2ban-client status 2>/dev/null | sed 's/^/  /' || true
+    fail2ban-client status sshd 2>/dev/null | sed 's/^/  /' || true
+  fi
   ok "第 8 项完成。"
-  warn "Fail2ban 是 SSH Key + UFW + 关闭密码登录的补充，不是替代品。"
-  warn "不要故意输错密码测试，以免把自己的公网 IP 封掉。"
+  warn "Fail2ban 是 SSH 加固的补充，不是替代品；不要故意输错密码测试，以免封掉自己。"
 }
 
-#---------------------------- 第 9 项：3X-UI 面板入口（检查 + 可选白名单） ----------------------------#
+#------------------------------ 第 9 / 10 项：3X-UI ------------------------------#
+
+xui_installed() {
+  svc_exists x-ui || [ -f /etc/systemd/system/x-ui.service ] || [ -f /lib/systemd/system/x-ui.service ] || [ -f /usr/lib/systemd/system/x-ui.service ]
+}
+
 step9_xui_panel() {
   hdr "第 9 项：保护 3X-UI 管理入口"
-  # 正确探测 x-ui 单元是否存在（list-unit-files <name> 即使不存在也返回 0）
-  if ! { systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service[[:space:]]' \
-         || [ -f /etc/systemd/system/x-ui.service ] \
-         || [ -f /lib/systemd/system/x-ui.service ]; }; then
-    warn "未检测到 x-ui 服务。请先完成第 2~8 项后再安装 3X-UI / Reality / Hysteria2。"
-    info "安装并配置完 3X-UI 后，请手动检查：非默认用户名 + 独立长密码 + 随机 Web Base Path + HTTPS + 2FA。"
+  if ! xui_installed; then
+    warn "未检测到 x-ui 服务（请先完成第 2~8 项，再安装 3X-UI / Reality / Hysteria2）。"
+    info "安装后请检查：非默认用户名 + 独立长密码 + 随机 Web Base Path + HTTPS + 2FA。"
     return 0
   fi
-  ok "检测到 x-ui 服务，当前监听端口:"
-  ss -lntup 2>/dev/null | grep -i x-ui | sed 's/^/  /' || ss -lntup | sed 's/^/  /'
-  info "面板安全检查项（请到 3X-UI 面板 / x-ui 命令里逐项核对）:"
+  ok "检测到 x-ui 服务，监听情况:"
+  net_listen 2>/dev/null | grep -i x-ui | sed 's/^/  /' || true
   cat <<'EOF' | sed 's/^/  /'
-  1. 管理员账号：非默认用户名 + 独立长密码，不与其他网站共用
-  2. Web Base Path：使用随机路径（降低被扫描命中的概率）
-  3. HTTPS：域名 / TLS 证书 / 私钥路径正确，浏览器无证书错误
-  4. 2FA：当前版本支持时开启两步验证
-  5. 不要在公开渠道泄漏：面板完整 URL / 账号密码 / API Token / 订阅链接 / UUID / Reality Private Key / TLS Private Key
+  面板安全检查项：
+   1. 管理员账号：非默认用户名 + 独立长密码，不与其他网站共用
+   2. Web Base Path：使用随机路径
+   3. HTTPS：证书/私钥路径正确，浏览器无证书错误
+   4. 2FA：版本支持时开启
+   5. 不要公开：面板完整 URL / 账号密码 / API Token / 订阅链接 / UUID / Reality Private Key / TLS Private Key
 EOF
-  if confirm "有固定公网管理 IP，是否现在就限制面板端口只允许该 IP 访问？"; then
+  if confirm "有固定公网管理 IP，是否限制面板端口只允许该 IP 访问？"; then
     local ADMIN_IP="" PANEL_PORT=""
-    read -r -p "输入您的固定管理公网 IP: " ADMIN_IP
-    read -r -p "输入 3X-UI 面板端口: " PANEL_PORT
-    [ -n "$ADMIN_IP" ] && [ -n "$PANEL_PORT" ] || { err "IP 或端口为空，已跳过。"; return 1; }
-    ufw allow from "$ADMIN_IP" to any port "$PANEL_PORT" proto tcp
-    ok "已添加白名单规则。请确认规则后再删除旧的全局放行规则:"
-    ufw status numbered | sed 's/^/  /'
-    warn "若原规则里有类似 \`Anywhere ALLOW <面板端口>\` 的全局放行，确认新规则生效后用: ufw delete <规则编号> 删除。"
-    warn "固定 IP 经常变化的用户请不要使用 IP 白名单。"
+    ask "输入固定管理公网 IP:" ADMIN_IP || return 1
+    ask "输入 3X-UI 面板端口:" PANEL_PORT || return 1
+    if { valid_ipv4 "$ADMIN_IP" || valid_ipv6 "$ADMIN_IP"; } && printf '%s' "$PANEL_PORT" | grep -qE '^[0-9]{1,5}$'; then
+      if fw_allow_from "$ADMIN_IP" "$PANEL_PORT" tcp; then
+        ok "已添加白名单: $ADMIN_IP → $PANEL_PORT/tcp"
+        warn "请确认新规则生效后，再删除该端口的全局放行规则。"
+      else
+        err "添加白名单失败（当前防火墙后端: $FW_BACKEND）。"
+      fi
+    else
+      err "IP 或端口不合法，已跳过。"
+    fi
   fi
 }
 
-#---------------------------- 第 10 项：备份 3X-UI 数据库 ----------------------------#
 step10_xui_backup() {
   hdr "第 10 项：备份 3X-UI 数据库并带离 VPS"
   if [ ! -f /etc/x-ui/x-ui.db ]; then
-    warn "未找到 /etc/x-ui/x-ui.db（默认 SQLite 数据库）。"
-    info "若使用 PostgreSQL / Docker Volume 等方案，请勿照抄本步 SQLite 方法。"
+    warn "未找到 /etc/x-ui/x-ui.db（默认 SQLite）。若使用 PostgreSQL/Docker Volume，请勿照抄本步。"
     return 0
   fi
   ls -lh /etc/x-ui/x-ui.db | sed 's/^/  /'
   mkdir -p /root/backups
   local dest="/root/backups/x-ui-$(date +%F-%H%M).db"
-  confirm "将短暂停止 x-ui 服务以生成一致副本，继续？" || return 0
-  systemctl stop x-ui
+  confirm "将短暂停止 x-ui 以生成一致副本，继续？" || return 0
+  if svc_exists x-ui; then svc_stop x-ui >/dev/null 2>&1 || true; fi
   cp /etc/x-ui/x-ui.db "$dest"
-  systemctl start x-ui
+  if svc_exists x-ui; then svc_start x-ui >/dev/null 2>&1 || true; fi
   sleep 1
-  systemctl is-active x-ui >/dev/null 2>&1 && ok "x-ui 已重新运行" || err "x-ui 未运行，请检查"
+  if svc_active x-ui; then ok "x-ui 已重新运行"; else warn "x-ui 未运行，请检查"; fi
   ok "数据库副本已生成: $dest"
   ls -lh "$dest" | sed 's/^/  /'
-  echo
-  warn "本机副本不是最终备份——服务器被删，本机备份也会消失。请立刻下载到 VPS 之外:"
-  echo "  本机执行:  scp root@<你的服务器IP>:$dest ."
-  echo "  或保存到另一台独立 VPS / 加密存储；含 x-ui.db、私钥、Token 的备份一律视为敏感数据。"
-  info "恢复点建议：基础加固完成后打一个厂商 Snapshot；3X-UI 配置完成后做应用配置外部备份。"
+  warn "本机副本不是最终备份，请立刻下载到 VPS 之外："
+  echo "  scp root@<你的服务器IP>:$dest ."
+  info "恢复点建议：基础加固后打厂商 Snapshot；3X-UI 配置完成后做配置外部备份。"
 }
 
-#---------------------------- 第 1 项（手动清单提醒） ----------------------------#
+#------------------------------ 第 1 项 / 汇总 ------------------------------#
+
 step1_manual() {
-  hdr "第 1 项：Console / MFA / 恢复能力（服务商后台手动完成，脚本无法代劳）"
+  hdr "第 1 项：Console / MFA / 恢复能力（服务商后台手动完成）"
   cat <<'EOF'
-  请在 VPS 服务商后台完成以下事项，再开始第 2 项：
   [ ] 实际登录一次 Web Console / VNC / Serial Console（不要只看有没有按钮）
-  [ ] 服务商账户开启 MFA（Authenticator / Passkey / 硬件密钥），恢复码保存在 VPS 之外
+  [ ] 服务商账户开启 MFA，恢复码保存在 VPS 之外
   [ ] 确认 Snapshot（快照）与 Reinstall（重装）入口
-  [ ] 确认 Cloud Firewall（云防火墙）入口并了解其规则
-  [ ] 记录：公网 IP / Ubuntu 版本 / 当前 SSH 端口 / Console 入口 / 快照位置
+  [ ] 确认 Cloud Firewall（云防火墙）入口与规则
+  [ ] 记录：公网 IP / 系统版本 / SSH 端口 / Console 入口 / 快照位置
 EOF
 }
 
-#---------------------------- 汇总报告 ----------------------------#
 final_report() {
-  hdr "汇总：请对照检查（教程『最终检查清单』节选）"
+  hdr "汇总：请对照检查"
+  local mode_txt="SSH Key 模式（密码认证已关闭）"
+  [ "$MODE" = "password" ] && mode_txt="密码登录模式（保留密码认证）"
+  info "本次模式: $mode_txt"
   cat <<'EOF'
-  退路   [ ] 厂商账户已开 MFA    [ ] 恢复码已保存    [ ] Console 已实测    [ ] 快照入口已确认
-  身份   [ ] sudo 用户已建        [ ] SSH Key 新窗口已验证    [ ] root SSH 登录已关闭    [ ] 密码认证已关闭
-         [ ] AllowUsers 填写正确  [ ] sshd -T 生效值符合预期
-  边界   [ ] UFW 已开启           [ ] SSH 端口已放行           [ ] 未提前开放无关端口     [ ] IPv6 已检查
-         [ ] 云防火墙已检查       [ ] ss -lntup 监听服务均确认用途
-  入口   [ ] 3X-UI 独立账号/强密码/随机路径/HTTPS/2FA    [ ] 面板敏感信息未公开
-  备份   [ ] x-ui 数据库已备份并保存到 VPS 之外          [ ] 基础加固后已做 Snapshot
+  退路   [ ] 厂商账户 MFA    [ ] 恢复码已保存    [ ] Console 已实测    [ ] 快照入口已确认
+  身份   [ ] sudo 用户已建    [ ] 新窗口验证通过  [ ] root SSH 登录已关闭
+         [ ] sshd 生效值符合预期（PermitRootLogin / AllowUsers / 认证方式）
+  边界   [ ] 防火墙已启用     [ ] SSH 端口已放行（或已限 IP）  [ ] 未提前开放无关端口
+         [ ] IPv6 与云防火墙已检查   [ ] 监听端口均已确认用途
+  入口   [ ] 3X-UI 独立账号/强密码/随机路径/HTTPS/2FA   [ ] 面板敏感信息未公开
+  备份   [ ] x-ui 数据库已备份到 VPS 之外   [ ] 基础加固后已做 Snapshot
 
-  三条铁律（教程原文）：
+  三条铁律：
    1. 任何影响 SSH 登录的配置：先保留旧连接，再用新窗口验证。
    2. 任何防火墙配置：必须明确自己正在开放什么。
    3. 任何重要配置：不能只有服务器本机这一份副本。
 EOF
-  info "完整清单见教程页底部。本脚本操作日志: $LOG_FILE"
+  info "平台: $PLAT_NAME  防火墙: $FW_BACKEND  init: $INIT  日志: $LOG_FILE"
 }
 
-#---------------------------- 菜单 ----------------------------#
+#------------------------------ 菜单 / 入口 ------------------------------#
+
 menu() {
+  local step5_label
+  if [ "$MODE" = "password" ]; then
+    step5_label="第 5 项  SSH 加固（关闭 root 登录，保留密码）"
+  else
+    step5_label="第 5 项  SSH 加固（关闭 root 登录 + 关闭密码认证）"
+  fi
   while true; do
     echo
-    hdr "新 VPS 基础安全一键脚本"
-    echo "  0) 预检（系统/身份/端口，+ 第 1 项手动清单）"
-    echo "  2) 第 2 项  更新系统 + 启用自动安全更新"
-    echo "  3) 第 3 项  创建普通 sudo 管理用户"
-    echo "  4) 第 4 项  安装 SSH Key 到普通用户"
-    echo "  5) 第 5 项  关闭 root / 密码登录（SSH 加固）"
-    echo "  6) 第 6 项  配置 UFW 防火墙"
-    echo "  7) 第 7 项  检查监听端口（只读报告）"
+    if [ "$MODE" = "password" ]; then
+      hdr "VPS 基础安全加固（密码登录模式）"
+    else
+      hdr "VPS 基础安全加固（SSH Key 模式）"
+    fi
+    echo "  0) 预检（平台/网络/端口）"
+    echo "  2) 第 2 项  更新系统 + 自动安全更新"
+    echo "  3) 第 3 项  创建普通 sudo 管理员"
+    if [ "$MODE" = "password" ]; then
+      echo "  4) 第 4 项  设置强密码 + 验证密码登录"
+    else
+      echo "  4) 第 4 项  安装 SSH 公钥 + 验证"
+    fi
+    echo "  5) $step5_label"
+    echo "  6) 第 6 项  配置防火墙（$FW_BACKEND）"
+    echo "  7) 第 7 项  检查监听端口（只读）"
     echo "  8) 第 8 项  安装并验证 Fail2ban"
-    echo "  9) 第 9 项  3X-UI 面板入口检查（已安装时可用）"
-    echo " 10) 第 10 项 备份 3X-UI 数据库（已安装时可用）"
-    echo "  a) 顺序执行 第 2→8 项（推荐，逐步确认）"
-    echo "  r) 显示最终检查清单"
-    echo "  q) 退出"
-    local choice
-    if ! ask "请选择（输入上面的编号后回车，q 退出）:" choice; then echo; exit 0; fi
+    echo "  9) 第 9 项  3X-UI 面板入口检查"
+    echo " 10) 第 10 项 备份 3X-UI 数据库"
+    echo "  a) 顺序执行 第 2→8 项（推荐）"
+    echo "  r) 显示检查清单     q) 退出"
+    local choice=""
+    if ! ask "请选择（输入编号后回车，q 退出）:" choice; then echo; exit 0; fi
     case "$choice" in
       0) os_check; step1_manual ;;
       2) step2_update ;;
       3) step3_user ;;
-      4) step4_sshkey ;;
+      4) if [ "$MODE" = "password" ]; then step4_password; else step4_sshkey; fi ;;
       5) step5_sshd ;;
-      6) step6_ufw ;;
+      6) step6_firewall ;;
       7) step7_listeners ;;
       8) step8_fail2ban ;;
       9) step9_xui_panel ;;
       10) step10_xui_backup ;;
       a) os_check; step1_manual
-         if step2_update && step3_user && step4_sshkey && step5_sshd && step6_ufw && step7_listeners && step8_fail2ban; then
+         run_chain=1
+         step2_update || run_chain=0
+         [ "$run_chain" = "1" ] && { step3_user || run_chain=0; }
+         if [ "$run_chain" = "1" ]; then
+           if [ "$MODE" = "password" ]; then step4_password || run_chain=0; else step4_sshkey || run_chain=0; fi
+         fi
+         [ "$run_chain" = "1" ] && { step5_sshd || run_chain=0; }
+         [ "$run_chain" = "1" ] && { step6_firewall || run_chain=0; }
+         [ "$run_chain" = "1" ] && { step7_listeners || run_chain=0; }
+         [ "$run_chain" = "1" ] && { step8_fail2ban || run_chain=0; }
+         if [ "$run_chain" = "1" ]; then
            final_report
          else
-           err "流程中断：请按上面的提示处理后，单独重跑该项（如 sudo bash $0 --step 5）再继续后续项。"
+           err "流程中断：请按上面提示处理后，单独重跑该项（如 sudo bash $0 --step 5）。"
          fi ;;
       r) final_report ;;
       q) exit 0 ;;
@@ -677,42 +1095,117 @@ menu() {
   done
 }
 
-#---------------------------- 入口 ----------------------------#
+usage() {
+  cat <<'EOF'
+用法：
+  sudo bash vps-hardening.sh                      # 交互式菜单（SSH Key 模式）
+  sudo bash vps-hardening.sh --mode password      # 密码登录模式（等价 --no-key）
+  sudo bash vps-hardening.sh --mode key           # SSH Key 模式（等价 --key，默认）
+  sudo bash vps-hardening.sh --auto               # 顺序执行第 2~8 项（逐步确认）
+  sudo bash vps-hardening.sh --step N             # 只执行某项（N=2..10，可与 --mode 组合）
+  sudo bash vps-hardening.sh --fail2ban           # 只执行第 8 项
+  sudo bash vps-hardening.sh --setup-only         # 只做平台检测并打印平台/能力报告，不修改系统
+
+环境变量：
+  DEBUG=1      打印执行的每条命令（排查“卡住/没有回显”）
+  FORCE=1      跳过第 5 项“新窗口已验证”的人工确认（谨慎）
+  VPS_FW=ufw|firewalld|iptables|manual|none   强制指定防火墙后端
+               （nftables 会映射为 manual：脚本不自动改写全局规则集，避免破坏 Docker 规则）
+  VPS_REPO / VPS_REF                 指定仓库与分支（自建镜像时用）
+
+支持平台：Debian/Ubuntu 系、RHEL/CentOS/Rocky/Alma/Fedora/Amazon、openSUSE/SLES、
+          Arch/Manjaro、Alpine、Gentoo、Void、FreeBSD/OpenBSD/NetBSD/DragonFly
+EOF
+}
+
 main() {
-  ensure_root "$@"
-  [ "${DEBUG:-0}" = "1" ] && set -x
-  printf '%b' "${C_BLD}${C_GRN}vps-hardening.sh 已启动${C_N}  PID=$$  时间=$(date '+%F %T')  日志=$LOG_FILE\n"
-  if [ ! -t 0 ]; then
-    warn "标准输入不是终端（管道或重定向）：交互提示将无法输入，脚本可能看起来“卡住”。"
-    warn "请改用 install.sh，或先下载脚本再执行：sudo bash vps-hardening.sh"
-  fi
-  log "=== vps-hardening.sh 开始: $* ==="
+  # --help 不要求 root（方便只读查看）
   case "${1:-}" in
-    --auto)      os_check; step1_manual
-                 if step2_update && step3_user && step4_sshkey && step5_sshd \
-                      && step6_ufw && step7_listeners && step8_fail2ban; then
-                   final_report
-                 else
-                   err "流程中断：请按上面的提示处理后，单独重跑该项（如 sudo bash $0 --step 5）再继续后续项。"
-                 fi ;;
-    --step)      shift
-                 case "${1:-}" in
-                   2) os_check; step2_update ;;
-                   3) step3_user ;;
-                   4) step4_sshkey ;;
-                   5) step5_sshd ;;
-                   6) step6_ufw ;;
-                   7) step7_listeners ;;
-                   8) os_check; step8_fail2ban ;;
-                   9) step9_xui_panel ;;
-                   10) step10_xui_backup ;;
-                   *) err "未知步骤: ${1:-}（可用 2~10）"; exit 1 ;;
-                 esac ;;
-    --fail2ban)  os_check; step8_fail2ban ;;
-    --help|-h)   grep -E '^#   ' "$0" | sed 's/^#   //'; exit 0 ;;
-    *)           menu ;;
+    -h|--help) usage; exit 0 ;;
   esac
-  log "=== vps-hardening.sh 结束 ==="
+  if [ "$(id -u)" -ne 0 ]; then
+    if [ -f "${BASH_SOURCE[0]:-}" ]; then
+      echo "需要 root 权限，使用 sudo 重新执行……"
+      exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+    fi
+    err "需要 root 权限：请用 sudo 运行。"
+    exit 1
+  fi
+  [ "${DEBUG:-0}" = "1" ] && set -x
+
+  local args=() step="" want_step=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --key) MODE=key ;;
+      --no-key|--password) MODE=password ;;
+      --mode) shift; case "${1:-}" in key|password) MODE="$1" ;; *) err "--mode 需要 key 或 password"; exit 1 ;; esac ;;
+      --auto) args+=(--auto) ;;
+      --fail2ban) args+=(--fail2ban) ;;
+      --setup-only) args+=(--setup-only) ;;
+      --step)
+        shift; want_step=1
+        case "${1:-}" in
+          2|3|4|5|6|7|8|9|10) step="$1" ;;
+          *) err "--step 需要跟一个数字（2~10）"; exit 1 ;;
+        esac ;;
+      *) err "未知参数: $1"; usage; exit 1 ;;
+    esac
+    shift
+  done
+  if [ "$want_step" = "1" ]; then
+    case "${args[0]:-}" in
+      --auto) err "--step 与 --auto 不能同时使用"; exit 1 ;;
+    esac
+  fi
+
+  printf '%b' "${C_BLD}${C_GRN}vps-hardening.sh 已启动${C_N}  PID=$$  时间=$(date '+%F %T')  模式=$MODE  日志=$LOG_FILE\n"
+  [ -t 0 ] || warn "标准输入不是终端：交互提示将无法输入，看起来会像“卡住”。请用 install.sh 或先下载再执行。"
+  plat_detect
+  log "=== 开始: mode=$MODE args=${args[*]:-} ==="
+
+  if [ "${args[0]:-}" = "--setup-only" ]; then
+    ok "依赖与平台检测正常，未做任何修改。"
+    plat_report
+    exit 0
+  fi
+
+  case "${args[0]:-}" in
+    --auto)  os_check; step1_manual
+             run_chain=1
+             step2_update || run_chain=0
+             [ "$run_chain" = "1" ] && { step3_user || run_chain=0; }
+             if [ "$run_chain" = "1" ]; then
+               if [ "$MODE" = "password" ]; then step4_password || run_chain=0; else step4_sshkey || run_chain=0; fi
+             fi
+             [ "$run_chain" = "1" ] && { step5_sshd || run_chain=0; }
+             [ "$run_chain" = "1" ] && { step6_firewall || run_chain=0; }
+             [ "$run_chain" = "1" ] && { step7_listeners || run_chain=0; }
+             [ "$run_chain" = "1" ] && { step8_fail2ban || run_chain=0; }
+             if [ "$run_chain" = "1" ]; then
+               final_report
+             else
+               err "流程中断：请按提示处理后单独重跑该项（如 sudo bash $0 --step 5）。"
+             fi ;;
+    --fail2ban) os_check; step8_fail2ban ;;
+    *)       if [ -n "$step" ]; then
+               os_check
+               case "$step" in
+                 2) step2_update ;;
+                 3) step3_user ;;
+                 4) if [ "$MODE" = "password" ]; then step4_password; else step4_sshkey; fi ;;
+                 5) step5_sshd ;;
+                 6) step6_firewall ;;
+                 7) step7_listeners ;;
+                 8) step8_fail2ban ;;
+                 9) step9_xui_panel ;;
+                 10) step10_xui_backup ;;
+                 *) err "未知步骤: $step（可用 2~10）"; exit 1 ;;
+               esac
+             else
+               menu
+             fi ;;
+  esac
+  log "=== 结束 ==="
 }
 
 main "$@"

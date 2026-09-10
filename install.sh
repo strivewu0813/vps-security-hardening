@@ -120,10 +120,15 @@ base_urls() {
 }
 
 # 校验下载结果确实是我们期望的脚本（防止拿到 HTML 错误页或截断内容）
+# 主脚本/封装：以 #!/...bash 开头且含 main "$@"；平台适配层：含 plat_detect 定义
 valid_script() {
   local f="$1"
   [ -s "$f" ] || return 1
   head -n1 "$f" | grep -q 'bash' || return 1
+  if grep -q '^plat_detect()' "$f"; then
+    grep -q 'ssh_apply_and_verify\|ssh_conf_prepare' "$f" || return 1
+    return 0
+  fi
   grep -q '^main "\$@"' "$f" || return 1
   grep -q 'vps-hardening' "$f" || return 1
   return 0
@@ -157,13 +162,19 @@ acquire() {
 }
 
 install_scripts() {
-  local key_dest="$INSTALL_DIR/vps-hardening" nokey_dest="$INSTALL_DIR/vps-hardening-no-key"
+  local key_dest="$INSTALL_DIR/vps-hardening"
+  local nokey_dest="$INSTALL_DIR/vps-hardening-no-key"
+  local lib_dir=/usr/local/lib/vps-hardening
+  local lib_dest="$lib_dir/platform.sh"
   mkdir -p "$INSTALL_DIR" || { err "无法创建 $INSTALL_DIR"; return 1; }
+  mkdir -p "$lib_dir" 2>/dev/null || { err "无法创建 $lib_dir"; return 1; }
   backup_foreign "$key_dest"
   backup_foreign "$nokey_dest"
   acquire "vps-hardening.sh" "$key_dest" || return 1
   acquire "vps-hardening-no-key.sh" "$nokey_dest" || return 1
+  acquire "lib/platform.sh" "$lib_dest" || return 1
   chmod 755 "$key_dest" "$nokey_dest" 2>/dev/null || true
+  chmod 644 "$lib_dest" 2>/dev/null || true
   return 0
 }
 
@@ -185,6 +196,10 @@ run_script() {
   if [ ! -f "$target" ]; then
     err "找不到 $target"
     return 1
+  fi
+  # 主脚本需要平台适配层：已装到 /usr/local/lib/vps-hardening/platform.sh
+  if [ ! -r /usr/local/lib/vps-hardening/platform.sh ]; then
+    warn "未找到 /usr/local/lib/vps-hardening/platform.sh，主脚本会尝试自行下载。"
   fi
   if [ -t 0 ]; then
     bash "$target" "$@"
