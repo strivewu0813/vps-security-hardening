@@ -1,6 +1,6 @@
 # 新 VPS 基础安全一键脚本（两个版本）
 
-依据 Notion 教程《[VPS入门篇：新 VPS 入手后必须先做的 10 项安全设置](https://toothsome-package-7ce.notion.site/VPS-VPS-10-3b537d2f12398104b317ce58cfc9ac30)》（Ubuntu 24.04 LTS）整理的自动化加固脚本，面向准备部署 **3X-UI / VLESS Reality / Hysteria2 / Trojan** 的节点 VPS。
+自动化加固脚本，面向准备部署 **3X-UI / VLESS Reality / Hysteria2 / Trojan** 的节点 VPS。
 
 ## 两个版本怎么选
 
