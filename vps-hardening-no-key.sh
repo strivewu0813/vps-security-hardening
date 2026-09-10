@@ -58,6 +58,29 @@ confirm() {
   case "${ans,,}" in y|yes) return 0;; *) return 1;; esac
 }
 
+# 带超时的确认：无输入/EOF 时按默认值处理，避免“卡在预检”这类无限等待
+# $1=提示 $2=秒数(默认15) $3=默认值 y|n(默认 y)
+confirm_timed() {
+  local msg="$1" secs="${2:-15}" def="${3:-y}" ans=""
+  printf '%b' "${C_YEL}?${C_N} $msg [y/N] ${C_CYN}(${secs}s 无输入则按默认 ${def})${C_N}: "
+  if read -r -t "$secs" ans; then
+    case "${ans,,}" in
+      '') [ "$def" = "y" ] && return 0 || return 1 ;;
+      y|yes) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  echo
+  warn "${secs}s 内没有输入，按默认 ${def} 处理。"
+  [ "$def" = "y" ]
+}
+
+# 带超时地运行命令：某些环境（网络被墙、ss -p 卡住等）可能长时间无输出
+run_timed() {
+  local secs="$1"; shift
+  if need_cmd timeout; then timeout "$secs" "$@"; else "$@"; fi
+}
+
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_root() {
@@ -169,29 +192,38 @@ guard_key_version_conflict() {
 os_check() {
   if [ -r /etc/os-release ]; then . /etc/os-release; fi
   hdr "0. 系统与 VPS 身份预检"
-  info "当前系统：${PRETTY_NAME:-未知}"
+  info "[1/5] 系统信息"
+  info "  ${PRETTY_NAME:-未知}  (ID=${ID:-未知} VERSION_ID=${VERSION_ID:-未知})"
   case "${ID:-}" in
     ubuntu|debian)
       if [ "${VERSION_ID:-}" != "24.04" ]; then
-        warn "教程以 Ubuntu 24.04 LTS 为例。您当前是 ${PRETTY_NAME:-?}，思路可参考，但命令请自行核对。"
-        confirm "是否继续？" || exit 0
+        warn "教程以 Ubuntu 24.04 LTS 为例。您当前是 ${PRETTY_NAME:-?}：命令大体通用，但请自行核对。"
+        confirm_timed "是否继续？" 15 y || { err "已按要求退出（未做任何修改）。"; exit 0; }
       fi ;;
     *)
-      warn "未识别到 Ubuntu / Debian，本脚本命令可能不适用。"
-      confirm "仍然继续？" || exit 0 ;;
+      warn "未识别到 Ubuntu / Debian（当前 ID=${ID:-未知}），本脚本命令可能不适用。"
+      confirm_timed "仍然继续？" 20 n || { err "已退出（未做任何修改）。"; exit 0; }
+      ;;
   esac
 
-  info "公网 IP / 地区 / ASN（核对是否买错区）:"
-  if need_cmd curl; then curl -s --max-time 10 ipinfo.io || echo "  (ipinfo.io 不可达，可稍后手动执行: curl -s ipinfo.io)"
+  info "[2/5] 公网 IP / 地区 / ASN（不通会自动跳过，最多等 8 秒）"
+  if need_cmd curl; then
+    curl -s --connect-timeout 4 --max-time 8 ipinfo.io \
+      || warn "ipinfo.io 不可达，已跳过。可稍后手动执行: curl -s ipinfo.io"
+  else
+    warn "未安装 curl，已跳过。可稍后手动执行: curl -s ipinfo.io"
   fi
 
-  info "本机网卡地址:"
-  ip -br addr 2>/dev/null | sed 's/^/  /'
-  info "当前 SSH 实际端口: $(ssh_port)"
-  info "当前监听端口一览:"
-  ss -lntup 2>/dev/null | sed 's/^/  /' || true
-  info "当前密码登录相关生效值:"
-  sshd -T 2>/dev/null | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|maxauthtries) ' | sed 's/^/  /'
+  info "[3/5] 本机网卡地址"
+  run_timed 10 ip -br addr 2>/dev/null | sed 's/^/  /'
+
+  info "[4/5] SSH 端口与监听端口（最多等 10 秒）"
+  info "  SSH 实际端口: $(ssh_port)"
+  run_timed 10 ss -lntup 2>/dev/null | sed 's/^/  /'
+  info "  当前密码登录相关生效值:"
+  run_timed 5 sshd -T 2>/dev/null | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|maxauthtries) ' | sed 's/^/    /'
+
+  info "[5/5] 需要你手动确认的事项"
   warn "请现在就在服务商后台实际登录一次 Console / VNC，并确认快照与云防火墙入口存在。"
   ok "预检完成。"
 }
@@ -616,7 +648,7 @@ ssh_ip_whitelist() {
 step7_listeners() {
   hdr "第 7 项：检查所有监听端口（只读报告，不修改任何配置）"
   info "当前监听端口与进程:"
-  ss -lntup 2>/dev/null | sed 's/^/  /' || { err "ss 不可用，请安装 iproute2"; return 1; }
+  run_timed 10 ss -lntup 2>/dev/null | sed 's/^/  /' || { err "ss 不可用或超时，请安装 iproute2"; return 1; }
   echo
   info "当前运行中的服务:"
   systemctl --type=service --state=running 2>/dev/null | sed 's/^/  /'
