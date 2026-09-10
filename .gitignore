@@ -1,0 +1,15 @@
+# 依赖目录（本仓库的脚本无需任何依赖，这里只是本地做语法检查时用到的工具）
+node_modules/
+package.json
+package-lock.json
+
+# 编辑器 / 系统文件
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地临时产物
+*.log
+*.bak

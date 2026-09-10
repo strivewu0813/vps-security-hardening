@@ -9,11 +9,49 @@
 | **SSH Key 版**（推荐） | `vps-hardening.sh` | 公钥登录，关闭密码认证 | 愿意配置 SSH Key 的用户；安全性最高 |
 | **无 Key / 密码版** | `vps-hardening-no-key.sh` | 保持"用户名 + 密码"登录 | 暂时不想配置 SSH Key、习惯密码登录的用户 |
 
-密码版会用这些手段弥补没有 Key 的风险：自动生成 20 位随机密码、关闭 root 直接登录、`MaxAuthTries 3` + `LoginGraceTime 30`、`AllowUsers` 限定用户、Fail2ban 默认更严格（3 次/2 小时）、可选把 SSH 限制为固定管理 IP。
+密码版会用这些手段弥补没有 Key 的风险：自动生成 32 位随机密码、关闭 root 直接登录、`MaxAuthTries 3` + `LoginGraceTime 60`、`AllowUsers` 限定用户、Fail2ban 默认更严格（3 次/2 小时）、可选把 SSH 限制为固定管理 IP。
 
 > 两个脚本共用操作日志 `/var/log/vps-hardening.log`，并会在第 5 项自动检测、备份另一个版本留下的 SSH 配置，避免互相覆盖。
 
-## 快速开始
+## 文件说明
+
+| 文件 | 说明 |
+|---|---|
+| `install.sh` | 一键安装入口：装到 `/usr/local/bin`，支持 curl 管道运行、镜像回退、`--install-only` |
+| `vps-hardening.sh` | SSH Key 版加固脚本（关闭密码认证） |
+| `vps-hardening-no-key.sh` | 无 Key / 密码登录版加固脚本 |
+| `LICENSE` | MIT License |
+| `.gitattributes` | 强制 shell 脚本使用 LF 换行 |
+| `README.md` | 本说明 |
+
+## 一键安装（推荐）
+
+先把脚本装到 `/usr/local/bin`，再运行；装好后可以随时重复执行（加固流程支持中断后继续）：
+
+```bash
+# 方式一：先下载、看一眼内容再执行（更安全）
+curl -fsSLO https://raw.githubusercontent.com/strivewu0813/vps-security-hardening/main/install.sh
+sudo bash install.sh                 # 默认安装并运行 SSH Key 版
+sudo bash install.sh --no-key        # 安装并运行 无 Key / 密码登录版
+sudo bash install.sh --install-only  # 只安装，不立即运行
+
+# 方式二：一行直通（管道方式，脚本会自动把交互输入切到 /dev/tty）
+curl -fsSL https://raw.githubusercontent.com/strivewu0813/vps-security-hardening/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/strivewu0813/vps-security-hardening/main/install.sh | sudo bash -s -- --no-key
+```
+
+安装后得到：
+
+```bash
+sudo /usr/local/bin/vps-hardening                  # SSH Key 版
+sudo /usr/local/bin/vps-hardening-no-key           # 无 Key / 密码登录版
+sudo /usr/local/bin/vps-hardening --step 5         # 只重跑某一项（2~10）
+```
+
+`install.sh` 的其他参数：`--auto`、`--step N`、`--fail2ban`（透传给加固脚本）、`--ref REF`（分支/标签）、`--mirror URL`（下载镜像）、`--dir DIR`（安装目录）、`-h`。
+下载源默认依次尝试 `raw.githubusercontent.com` → `cdn.jsdelivr.net`；若当前目录里已有仓库文件（本地克隆），则直接使用本地文件、不联网。
+
+## 直接运行（不想安装时）
 
 SSH Key 版：
 
@@ -85,3 +123,13 @@ sudo bash vps-hardening-no-key.sh --fail2ban   # 只执行第 8 项 Fail2ban
 ## 操作日志
 
 脚本会把每次操作写入 `/var/log/vps-hardening.log`。
+
+## 免责声明
+
+脚本会修改 SSH、防火墙与软件包配置。请务必先按教程第 1 项确认厂商 Console / 快照可用，并在**保留当前会话**的前提下用**新窗口**验证每一步；因误操作导致的失联或数据丢失，作者不承担责任。
+
+## License
+
+[MIT](LICENSE) © 2026 strivewu0813
+
+教程内容（Notion 页面）版权归原作者所有，本仓库仅包含依据该教程整理出的脚本与说明。
