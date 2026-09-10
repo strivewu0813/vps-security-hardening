@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 #=============================================================================
 # vps-hardening.sh
-# 新 VPS 基础安全一键加固脚本（依据 Notion 教程整理）
+# 新 VPS 基础安全一键加固脚本（SSH Key 版）
 #
-# 教程：《VPS入门篇：新 VPS 入手后必须先做的 10 项安全设置》
-#   https://toothsome-package-7ce.notion.site/VPS-VPS-10-3b537d2f12398104b317ce58cfc9ac30
-# 测试环境：Ubuntu 24.04 LTS / 初始 root 或具备 sudo 的管理员
-# 适用：准备部署 3X-UI / VLESS Reality / Hysteria2 / Trojan 的节点 VPS
+# 适用环境：Ubuntu 24.04 LTS / 初始 root 或具备 sudo 权限的管理员
+# 适用场景：准备部署 3X-UI / VLESS Reality / Hysteria2 / Trojan 的节点 VPS
 #
 # 用法：
 #   sudo bash vps-hardening.sh              # 交互式菜单
@@ -14,7 +12,10 @@
 #   sudo bash vps-hardening.sh --step N     # 只执行某项（N=2..10）
 #   sudo bash vps-hardening.sh --fail2ban   # 只执行第 8 项 Fail2ban
 #
-# ⚠️ 重要安全提示（来自教程原文，务必遵守）：
+# 卡住 / 没有输出时：用 DEBUG=1 查看每条命令的执行进度
+#   sudo DEBUG=1 bash vps-hardening.sh 2>&1 | tee /tmp/hardening-debug.log
+#
+# ⚠️ 重要安全提示（务必遵守）：
 #   1. 第 1 项(厂商 Console / MFA / 快照)只能在服务商后台手动完成，本脚本只负责提醒。
 #   2. 任何可能影响 SSH 登录的配置，都必须先保留旧连接，再使用【新窗口】完成验证；
 #      在 SSH Key 未通过新窗口验证之前，不要关闭密码登录，不要退出当前 SSH 会话。
@@ -42,7 +43,7 @@ log()  { printf '%s  %s\n' "$(date '+%F %T')" "$*" | sudo tee -a "$LOG_FILE" >/d
 #---------------------------- 辅助函数 ----------------------------#
 confirm() {
   local msg="$1" ans
-  printf '%b' "${C_YEL}?${C_N} $msg [y/N] "
+  printf '%b' "${C_YEL}?${C_N} $msg [y/N]:\n"
   read -r ans || ans=n
   case "${ans,,}" in y|yes) return 0;; *) return 1;; esac
 }
@@ -51,7 +52,7 @@ confirm() {
 # $1=提示 $2=秒数(默认15) $3=默认值 y|n(默认 y)
 confirm_timed() {
   local msg="$1" secs="${2:-15}" def="${3:-y}" ans=""
-  printf '%b' "${C_YEL}?${C_N} $msg [y/N] ${C_CYN}(${secs}s 无输入则按默认 ${def})${C_N}: "
+  printf '%b' "${C_YEL}?${C_N} $msg [y/N] ${C_CYN}(${secs}s 无输入则按默认 ${def})${C_N}:\n"
   if read -r -t "$secs" ans; then
     case "${ans,,}" in
       '') [ "$def" = "y" ] && return 0 || return 1 ;;
@@ -62,6 +63,15 @@ confirm_timed() {
   echo
   warn "${secs}s 内没有输入，按默认 ${def} 处理。"
   [ "$def" = "y" ]
+}
+
+# 读取一行输入：提示独占一行，避免某些终端（如厂商 VNC Console）不渲染无换行提示符
+ask() {
+  local prompt="$1" var="$2" ans=""
+  printf '%s\n> ' "$prompt"
+  IFS= read -r ans || return 1
+  printf -v "$var" '%s' "$ans"
+  return 0
 }
 
 # 带超时地运行命令：某些环境（网络被墙、ss -p 卡住等）可能长时间无输出
@@ -199,7 +209,7 @@ pick_user() {
     fi
   fi
   if [ -z "${NEW_USER:-}" ]; then
-    read -r -p "输入管理员用户名: " NEW_USER || { echo; return 1; }
+    ask "输入管理员用户名:" NEW_USER || return 1
   fi
   # 关键闸门：绝不允许对 root 执行。第 5 项会写 PermitRootLogin no 且 AllowUsers 只保留该用户，
   # 若这里是 root，则 root 被 PermitRootLogin 拒绝、其他人被 AllowUsers 拒绝 → 所有 SSH 登录失败。
@@ -214,7 +224,7 @@ step3_user() {
   hdr "第 3 项：创建普通 sudo 管理用户"
   local NEW_USER=""
   while :; do
-    read -r -p "输入要创建的管理员用户名(小写字母/数字，如 alex): " NEW_USER || { echo; return 1; }
+    ask "输入要创建的管理员用户名(小写字母/数字，如 alex):" NEW_USER || return 1
     if printf '%s' "$NEW_USER" | grep -qE '^[a-z_][a-z0-9_-]*$'; then break; fi
     err "用户名不合法，只能用小写字母、数字、下划线、连字符。"
   done
@@ -250,8 +260,7 @@ step4_sshkey() {
   mkdir -p "$keydir" && chmod 700 "$keydir"
 
   local PUBKEY=""
-  printf '%b' "${C_YEL}?${C_N} 请把【本机】生成的公钥【完整一行】粘贴到这里（ssh-ed25519 / ssh-rsa / ecdsa-sha2 开头，粘贴后回车即可）:\n  > "
-  read -r PUBKEY || { echo; return 1; }
+  ask "请把【本机】生成的公钥【完整一行】粘贴到这里（ssh-ed25519 / ssh-rsa / ecdsa-sha2 开头，粘贴后回车即可）:" PUBKEY || return 1
   PUBKEY=${PUBKEY%$'\r'}   # 去掉 Windows 粘贴可能带来的结尾 \r
   case "$PUBKEY" in
     '')
@@ -643,7 +652,7 @@ menu() {
     echo "  r) 显示最终检查清单"
     echo "  q) 退出"
     local choice
-    if ! read -r -p "请选择: " choice; then echo; exit 0; fi
+    if ! ask "请选择（输入上面的编号后回车，q 退出）:" choice; then echo; exit 0; fi
     case "$choice" in
       0) os_check; step1_manual ;;
       2) step2_update ;;
@@ -671,6 +680,12 @@ menu() {
 #---------------------------- 入口 ----------------------------#
 main() {
   ensure_root "$@"
+  [ "${DEBUG:-0}" = "1" ] && set -x
+  printf '%b' "${C_BLD}${C_GRN}vps-hardening.sh 已启动${C_N}  PID=$$  时间=$(date '+%F %T')  日志=$LOG_FILE\n"
+  if [ ! -t 0 ]; then
+    warn "标准输入不是终端（管道或重定向）：交互提示将无法输入，脚本可能看起来“卡住”。"
+    warn "请改用 install.sh，或先下载脚本再执行：sudo bash vps-hardening.sh"
+  fi
   log "=== vps-hardening.sh 开始: $* ==="
   case "${1:-}" in
     --auto)      os_check; step1_manual

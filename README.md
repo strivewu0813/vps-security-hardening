@@ -120,16 +120,42 @@ sudo bash vps-hardening-no-key.sh --fail2ban   # 只执行第 8 项 Fail2ban
 - 备份：x-ui 数据库备份并保存到 VPS 之外；基础加固完成后打厂商 Snapshot
 - 密码版追加：密码唯一且足够长、保存到密码管理器、Fail2ban 必须保持启用
 
+## 卡住 / 没有输出怎么办
+
+脚本已对可能长时间等待的环节加了超时与进度标记（预检的 `[1/5]`~`[5/5]`、`confirm_timed` 无输入按默认继续、`ipinfo.io` 最多 8 秒、`ss` / `sshd -T` 用 `timeout` 包裹）。如果还是"卡住且没有任何回显"，按下面顺序排查：
+
+```bash
+# 1) 打开 DEBUG 模式重跑，可直接看到卡在哪条命令（最有用）
+sudo DEBUG=1 bash /usr/local/bin/vps-hardening 2>&1 | tee /tmp/hardening-debug.log
+# 卡住后在另一个窗口看最后 20 行：
+tail -n 20 /tmp/hardening-debug.log
+
+# 2) 确认脚本进程真的在跑，以及它在等什么
+pgrep -af 'vps-hardening' || echo "进程不存在（可能已退出）"
+pid=$(pgrep -f 'vps-hardening' | head -n1); [ -n "$pid" ] && sudo cat /proc/$pid/wchan; echo
+
+# 3) 确认标准输入是不是终端（管道/重定向会让提示无法输入）
+[ -t 0 ] && echo "stdin 是终端，正常" || echo "stdin 不是终端：请改用 install.sh 或先下载再执行"
+```
+
+常见原因与处理：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 执行后完全没有输出 | 用 `curl \| bash` 时 GitHub 被墙，脚本还没下载下来 | 用 `install.sh`（自动回退 jsDelivr），或加 `--mirror`，或先下载再执行 |
+| 停在 `? ... [y/N]` 不动 | 该提示在等输入（新版 15 秒无输入按默认继续） | 直接输入 `y` 回车；或更新到最新版本 |
+| 停在 `[INFO] 公网 IP / 地区 / ASN` | `ipinfo.io` 被墙 | 新版最多等 8 秒自动跳过，不影响后续 |
+| 停在菜单"请选择"后没反应 | stdin 不是终端（管道执行），输入被丢弃 | 改用 `sudo /usr/local/bin/vps-hardening`，不要用 `curl \| bash` 直接跑加固脚本 |
+| 敲了 `y` 屏幕没反应 | 厂商 VNC Console 对无换行提示符渲染异常 | 新版提示符已独占一行并带换行；建议改用 SSH 而非 Console |
+
 ## 操作日志
 
 脚本会把每次操作写入 `/var/log/vps-hardening.log`。
 
 ## 免责声明
 
-脚本会修改 SSH、防火墙与软件包配置。请务必先按教程第 1 项确认厂商 Console / 快照可用，并在**保留当前会话**的前提下用**新窗口**验证每一步；因误操作导致的失联或数据丢失，作者不承担责任。
+脚本会修改 SSH、防火墙与软件包配置。请务必先确认厂商 Console / 快照可用，并在**保留当前会话**的前提下用**新窗口**验证每一步；因误操作导致的失联或数据丢失，作者不承担责任。
 
 ## License
 
 [MIT](LICENSE) © 2026 strivewu0813
-
-教程内容（Notion 页面）版权归原作者所有，本仓库仅包含依据该教程整理出的脚本与说明。
