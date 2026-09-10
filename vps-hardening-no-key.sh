@@ -66,7 +66,7 @@ for cand in \
   "${selfdir:-/nonexistent}/vps-hardening" \
   "${selfdir:-/nonexistent}/vps-hardening.sh" \
   /usr/local/bin/vps-hardening \
-  /usr/local/lib/vps-hardening/vps-hardening.sh
+  "${VPS_LIB_DIR:-/usr/local/lib/vps-hardening}/vps-hardening.sh"
 do
   if is_engine "$cand"; then engine="$cand"; break; fi
 done

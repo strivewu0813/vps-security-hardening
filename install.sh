@@ -55,6 +55,10 @@ warn() { printf '%b' "${C_YEL}[WARN]${C_N} $*\n" >&2; }
 err()  { printf '%b' "${C_RED}[ERR ]${C_N} $*\n" >&2; }
 hdr()  { printf '%b' "\n${C_BLD}${C_CYN}========== $* ==========${C_N}\n"; }
 
+# 注意：install.sh 不加载 lib/platform.sh，所以这里必须自己定义需要用的辅助函数
+# （曾经漏掉 need_cmd，导致 "need_cmd: command not found" 并把「有 curl」误判成「没有下载工具」）
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
 usage() {
   cat <<'EOF'
 用法：
@@ -173,7 +177,7 @@ acquire() {
 install_scripts() {
   local key_dest="$INSTALL_DIR/vps-hardening"
   local nokey_dest="$INSTALL_DIR/vps-hardening-no-key"
-  local lib_dir=/usr/local/lib/vps-hardening
+  local lib_dir="${VPS_LIB_DIR:-/usr/local/lib/vps-hardening}"
   local lib_dest="$lib_dir/platform.sh"
   mkdir -p "$INSTALL_DIR" || { err "无法创建 $INSTALL_DIR"; return 1; }
   mkdir -p "$lib_dir" 2>/dev/null || { err "无法创建 $lib_dir"; return 1; }

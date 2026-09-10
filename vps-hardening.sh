@@ -63,6 +63,7 @@ print_usage() {
   VPS_FW=ufw|firewalld|iptables|manual|none   强制指定防火墙后端
                （nftables 会映射为 manual：脚本不自动改写全局规则集，避免破坏 Docker 规则）
   VPS_REPO / VPS_REF                 指定仓库与分支（自建镜像时用）
+  VPS_LIB_DIR                        平台适配层所在目录（默认 /usr/local/lib/vps-hardening）
 
 支持平台：Debian/Ubuntu 系、RHEL/CentOS/Rocky/Alma/Fedora/Amazon/Oracle、openSUSE/SLES、
           Arch/Manjaro、Alpine、Gentoo、Void、FreeBSD/OpenBSD/NetBSD/DragonFly
@@ -84,17 +85,18 @@ _lib_ok() { [ -r "$1" ] && grep -q 'plat_detect' "$1" 2>/dev/null; }
 load_platform_lib() {
   local self="${BASH_SOURCE[0]:-}" dir="" cand
   if [ -n "$self" ] && [ -f "$self" ]; then dir=$(cd -- "$(dirname -- "$self")" >/dev/null 2>&1 && pwd); fi
+  local libdir="${VPS_LIB_DIR:-/usr/local/lib/vps-hardening}"
   for cand in \
     "${dir:-/nonexistent}/lib/platform.sh" \
     "${dir:-/nonexistent}/platform.sh" \
-    /usr/local/lib/vps-hardening/platform.sh \
-    /usr/local/lib/vps-hardening.sh
+    "$libdir/platform.sh" \
+    /usr/local/lib/vps-hardening/platform.sh
   do
     if _lib_ok "$cand"; then . "$cand"; return 0; fi
   done
 
   printf '%s\n' "未找到 lib/platform.sh（跨发行版适配层），尝试从 GitHub 下载……"
-  local dest_dir=/usr/local/lib/vps-hardening
+  local dest_dir="${VPS_LIB_DIR:-/usr/local/lib/vps-hardening}"
   local dest="$dest_dir/platform.sh"
   local tmp base url
   mkdir -p "$dest_dir" 2>/dev/null || dest=/tmp/platform.sh

@@ -204,6 +204,42 @@ chk "install 会安装 lib/platform.sh" 0 "$(grep -qF 'lib/platform.sh' install.
 chk "install 先装平台层再装引擎" 0 "$(awk '/acquire "lib\/platform.sh"/{l=NR} /acquire "vps-hardening.sh"/{e=NR} END{exit !(l && e && l<e)}' install.sh && echo 0 || echo 1)"
 
 rm -rf tests/fakebin
+
+echo "== 12. install.sh / 封装 不得调用未加载的辅助函数（need_cmd 曾经漏定义）=="
+LIB_FNS=$(grep -oE '^[a-z_]+\(\)' lib/platform.sh | tr -d '()' | sort -u)
+MISSING_LOCAL=""
+for f in install.sh vps-hardening-no-key.sh; do
+  LOCAL_FNS=$(grep -oE '^[a-z_]+\(\)' "$f" | tr -d '()' | sort -u)
+  for fn in $LIB_FNS; do
+    # 只看“被当作命令调用”的形态（名字后跟空白或 $），避免把字符串里的标记误判
+    if grep -qE "(^|[^[:alnum:]_])${fn}[[:space:]$]" "$f"; then
+      printf '%s\n' "$LOCAL_FNS" | grep -qx "$fn" || MISSING_LOCAL="$MISSING_LOCAL $f:$fn"
+    fi
+  done
+  chk "$f 未调用未定义的平台层函数" "" "$(printf '%s' "$MISSING_LOCAL" | grep -o "$f:[a-z_]*" | tr '\n' ' ')"
+done
+
+echo "== 13. install.sh 在沙箱里真的能跑（本地目录快路径，不联网）=="
+SBX="${TMPDIR:-/tmp}/vh-install-test.$$"
+mkdir -p "$SBX/bin" "$SBX/lib" "$SBX/stub"
+printf '#!/bin/sh\nexit 1\n' > "$SBX/stub/curl"; chmod +x "$SBX/stub/curl"
+printf '#!/bin/sh\nexit 1\n' > "$SBX/stub/wget"; chmod +x "$SBX/stub/wget"
+printf '#!/bin/sh\necho 0\n' > "$SBX/stub/id";   chmod +x "$SBX/stub/id"
+chk "未定义函数静态检查（need_cmd 类问题）" "" "$MISSING_LOCAL"
+out=$(PATH="$SBX/stub:$PATH" VPS_LIB_DIR="$SBX/lib" bash ./install.sh --dir "$SBX/bin" --install-only 2>&1); rc=$?
+chk "install.sh --install-only 退出码 0（本地快路径）" 0 "$rc"
+chk "输出里没有 'command not found'" 1 "$(printf '%s' "$out" | grep -q 'command not found' && echo 0 || echo 1)"
+chk "输出里没有 '未找到命令'（中文 locale）" 1 "$(printf '%s' "$out" | grep -q '未找到命令' && echo 0 || echo 1)"
+chk "没有误报「未找到 curl 或 wget」" 1 "$(printf '%s' "$out" | grep -q '未找到 curl 或 wget' && echo 0 || echo 1)"
+chk "装上了主引擎" 0 "$([ -s "$SBX/bin/vps-hardening" ] && echo 0 || echo 1)"
+chk "装上了封装" 0 "$([ -s "$SBX/bin/vps-hardening-no-key" ] && echo 0 || echo 1)"
+chk "装上了平台层（VPS_LIB_DIR 可覆盖）" 0 "$([ -s "$SBX/lib/platform.sh" ] && echo 0 || echo 1)"
+# 装出来的脚本要能真的跑起来（引擎能通过 VPS_LIB_DIR 找到平台层）
+out2=$(PATH="$SBX/stub:$PATH" VPS_LIB_DIR="$SBX/lib" bash "$SBX/bin/vps-hardening" --setup-only 2>&1); rc2=$?
+chk "装好的引擎可运行（--setup-only 退出码 0）" 0 "$rc2"
+chk "装好的引擎打印平台报告" 0 "$(printf '%s' "$out2" | grep -q '系统     :' && echo 0 || echo 1)"
+rm -rf "$SBX"
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" = "0" ]

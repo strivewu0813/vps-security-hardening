@@ -67,6 +67,7 @@ sudo /usr/local/bin/vps-hardening --setup-only     # 只做平台检测，不改
 ```
 
 `install.sh` 参数：`--key` / `--no-key`、`--install-only`、`--auto`、`--step N`、`--fail2ban`（透传）、`--ref REF`、`--mirror URL`、`--dir DIR`、`-h`。
+环境变量 `VPS_LIB_DIR` 可覆盖平台适配层的安装目录（默认 `/usr/local/lib/vps-hardening`，引擎与封装会按同一变量查找）。
 下载源默认回退 `raw.githubusercontent.com` → `cdn.jsdelivr.net`；若当前目录已有仓库文件（本地克隆）则直接用本地文件、不联网。
 
 ## 直接运行
