@@ -124,7 +124,16 @@ bash tests/integration.sh     #  27 项：把引擎复制到沙箱并重写路�
 
 ## 卡住 / 没有输出怎么办
 
-脚本已对可能长时间等待的环节加了超时与进度标记（预检 `[1/5]`~`[5/5]`、`confirm_timed` 无输入按默认继续、`ipinfo.io` 最多 8 秒、`ss`/`netstat`/`sshd -T` 用 `timeout` 包裹）。
+脚本已对可能长时间等待的环节加了超时与进度标记（预检 `[1/5]`~`[5/5]`、`confirm_timed` 无输入按默认继续、`ipinfo.io` 最多 8 秒、`ss`/`netstat`/`ufw`/`firewall-cmd`/`systemctl`/`sshd -T` 等探测都由 `run_timed` 限时）。
+
+### 诊断模式（卡住时首选）
+
+```bash
+sudo /usr/local/bin/vps-hardening --diag       # 逐条测量：命令是否存在、每条耗时多久
+sudo VPS_TRACE=1 /usr/local/bin/vps-hardening  # 打印平台探测每一步；卡住时看最后一条 [trace]
+```
+
+`--diag` 会列出 `ss -lntup`、`ss -ltn`、`ufw status`、`firewall-cmd --state`、`systemctl list-unit-files`、`systemctl show ssh.socket`、`sshd -T`、`ip -br addr`、`crontab -l`、`curl ipinfo.io` 的存在性与耗时（每条最多 10 秒），并明确标出「命令不存在」。
 
 ```bash
 # 1) DEBUG 模式重跑，直接看到卡在哪条命令（最有用）
@@ -142,6 +151,7 @@ pid=$(pgrep -f 'vps-hardening' | head -n1); [ -n "$pid" ] && [ -r /proc/$pid/wch
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 完全没有输出 | `curl \| bash` 时 GitHub 被墙，脚本还没下载下来 | 用 `install.sh`（自动回退 jsDelivr）、加 `--mirror`，或先下载再执行 |
+| 选了预检后停住、连 `[1/5]` 都没出现 | 卡在平台探测的某条外部命令（`ss -lntup`、`ufw status`、`firewall-cmd --state`、`systemctl list-unit-files`…） | `Ctrl-C` 后跑 `--diag` 看是哪条；或用 `VPS_TRACE=1` 看最后一条 `[trace]` |
 | 停在 `? ... [y/N]` | 提示在等输入（新版 15 秒无输入按默认处理） | 输入 `y` 回车；或升级到最新版 |
 | 停在 `[INFO] 公网 IP / 地区 / ASN` | `ipinfo.io` 被墙 | 新版最多 8 秒自动跳过 |
 | 菜单"请选择"后无反应 | stdin 不是终端（管道执行），输入被丢弃 | 改用 `sudo /usr/local/bin/vps-hardening` |

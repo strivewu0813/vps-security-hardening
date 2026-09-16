@@ -55,9 +55,11 @@ print_usage() {
   sudo bash vps-hardening.sh --step N             # 只执行某项（N=2..10，可与 --mode 组合）
   sudo bash vps-hardening.sh --fail2ban           # 只执行第 8 项
   sudo bash vps-hardening.sh --setup-only         # 只打印平台/能力报告，不修改系统
+  sudo bash vps-hardening.sh --diag               # 逐条测量外部命令（是否存在/是否很慢）
 
 环境变量：
   DEBUG=1      打印执行的每条命令（排查“卡住/没有回显”）
+  VPS_TRACE=1  打印平台探测每一步在做什么（卡在预检时最有用）
   FORCE=1      跳过第 5 项“新窗口已验证”的人工确认（谨慎）
   MODE         默认模式：key 或 password
   VPS_FW=ufw|firewalld|iptables|manual|none   强制指定防火墙后端
@@ -126,7 +128,11 @@ load_platform_lib
 
 #------------------------------ 脚本级辅助 ------------------------------#
 
-log() { printf '%s  %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null || true; }
+log() {
+  # 日志目录可能不存在（精简系统/容器），不要让 bash 打印 redirection 报错
+  [ -d "${LOG_FILE%/*}" ] || return 0
+  printf '%s  %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
 
 abort_conf() {
   local conf="${1:-}" main_conf=/etc/ssh/sshd_config bak=""
@@ -280,9 +286,9 @@ grant_sudo_via_sudoers() {
 
 os_check() {
   hdr "0. 系统与平台预检"
+  info "正在探测平台（sshd / init / 防火墙）…… 若长时间无输出，请按 Ctrl-C 后用 --diag 或 VPS_TRACE=1 重跑"
   plat_detect
-  info "[1/5] 平台信息"
-  plat_report
+  info "[1/5] 平台信息"  plat_report
 
   if ! plat_is_supported; then
     warn "未识别的平台（$PLAT_NAME）：脚本会尽量按通用方式执行，但包管理/防火墙/自动更新可能无法自动处理。"
@@ -320,6 +326,57 @@ os_check() {
   info "[5/5] 需要你手动完成的事项"
   warn "请现在就在服务商后台实际登录一次 Console / VNC，并确认快照与云防火墙入口存在。"
   ok "预检完成。"
+}
+
+#------------------------------ 诊断模式 ------------------------------#
+
+# 逐条测量平台探测用到的命令：明确指出“命令不存在”还是“很慢/卡住”
+diag() {
+  hdr "诊断：平台与外部命令"
+  info "（每条都会限时，最长等 10 秒；'命令不存在' 表示该工具未安装）"
+  plat_detect
+  plat_report
+  echo
+  local t0 t1 out lines desc
+  probe() {
+    desc="$1"; shift
+    printf '  %-34s ' "$desc"
+    if ! need_cmd "$1" && [ ! -x "$1" ]; then
+      printf '%b\n' "${C_YEL}命令不存在: $1${C_N}"
+      return 0
+    fi
+    t0=$(date +%s)
+    out=$(run_timed 10 "$@" 2>&1)
+    t1=$(date +%s)
+    lines=$(printf '%s\n' "$out" | grep -c . )
+    if [ "$((t1 - t0))" -ge 8 ]; then
+      printf '%b\n' "${C_YEL}耗时 $((t1 - t0))s（很慢或已超时）  输出行数 $lines${C_N}"
+    else
+      printf '%b\n' "${C_GRN}耗时 $((t1 - t0))s  输出行数 $lines${C_N}"
+    fi
+  }
+  probe "ss -lntup（监听+进程）"    ss -lntup
+  probe "ss -ltn（监听）"           ss -ltn
+  probe "ufw status"                ufw status
+  probe "firewall-cmd --state"      firewall-cmd --state
+  probe "systemctl list-unit-files" systemctl list-unit-files
+  probe "systemctl show ssh.socket" systemctl show -p Listen --value ssh.socket
+  probe "sshd -T（生效配置）"       "${SSHD_BIN:-sshd}" -T
+  probe "ip -br addr"               ip -br addr
+  probe "crontab -l（若用 cron）"   crontab -l
+  echo
+  if need_cmd curl; then
+    printf '  %-34s ' "curl ipinfo.io（≤8s）"
+    t0=$(date +%s)
+    out=$(curl -s --connect-timeout 4 --max-time 8 ipinfo.io 2>&1)
+    t1=$(date +%s)
+    printf '耗时 %ss\n' "$((t1 - t0))"
+  fi
+  echo
+  info "如果上面某条显示“命令不存在”，请安装对应工具（iproute2 / ufw / firewalld / openssh-server 等）。"
+  info "如果某条耗时很长，请把这一行发我，我会为该探测加限时或改为降级方案。"
+  info "也可以在卡住时用 VPS_TRACE=1 重跑，看最后一条 [trace] 停在哪。"
+  ok "诊断结束（未修改任何系统配置）。"
 }
 
 #------------------------------ 第 2 项：系统更新 ------------------------------#
@@ -1196,6 +1253,7 @@ menu() {
     echo "  9) 第 9 项  3X-UI 面板入口检查"
     echo " 10) 第 10 项 备份 3X-UI 数据库"
     echo "  a) 顺序执行 第 2→8 项（推荐）"
+    echo "  d) 诊断模式（逐条测量外部命令：是否存在 / 是否很慢）"
     echo "  r) 显示检查清单     q) 退出"
     local choice=""
     if ! ask "请选择（输入编号后回车，q 退出）:" choice; then echo; exit 0; fi
@@ -1227,6 +1285,7 @@ menu() {
            err "流程中断：请按上面提示处理后，单独重跑该项（如 sudo bash $0 --step 5）。"
          fi ;;
       r) final_report ;;
+      d) diag ;;
       q) exit 0 ;;
       *) warn "无效选择: $choice" ;;
     esac
@@ -1292,6 +1351,7 @@ main() {
       --auto)       set_action auto ;;
       --fail2ban)   set_action fail2ban ;;
       --setup-only) set_action setup ;;
+      --diag)       set_action diag ;;
       --step)
         shift; set_action step
         case "${1:-}" in
@@ -1340,6 +1400,7 @@ main() {
                rc=1
              fi ;;
     fail2ban) os_check; step8_fail2ban || rc=1 ;;
+    diag)     diag ;;
     *)       if [ -n "$step" ]; then
                os_check
                case "$step" in

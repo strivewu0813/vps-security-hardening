@@ -30,6 +30,14 @@ fi
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# 跟踪输出：VPS_TRACE=1（或 DEBUG=1）时打印每一步在做什么。
+# 用途：脚本“卡住且没有任何输出”时，能立刻看出卡在哪一步。输出到 stderr，避免污染管道。
+trace() {
+  case "${VPS_TRACE:-${DEBUG:-0}}" in
+    1|yes|true|on) printf '%b' "${C_CYN}[trace]${C_N} $*\n" >&2 ;;
+  esac
+}
+
 # 等待输入的确认（危险操作前的闸门）；EOF 时按“否”处理，避免误放行
 confirm() {
   local msg="$1" ans=""
@@ -116,6 +124,7 @@ FW_BACKEND=""; FW_WHY=""
 HAVE_TIMEOUT=0; HAVE_SYSTEMD=0
 
 plat_detect() {
+  trace "detect: 读取系统信息（uname / /etc/os-release）"
   PLAT_ARCH=$(uname -m 2>/dev/null || echo unknown)
   PLAT_OS=$(uname -s 2>/dev/null || echo unknown)
 
@@ -168,6 +177,7 @@ plat_detect() {
   esac
 
   # init 系统
+  trace "detect: 识别 init 系统"
   if need_cmd systemctl && [ -d /run/systemd/system ]; then
     INIT=systemd; HAVE_SYSTEMD=1
   elif need_cmd rc-service; then
@@ -185,12 +195,16 @@ plat_detect() {
   need_cmd timeout && HAVE_TIMEOUT=1
 
   # sudo 组名（Debian 系用 sudo，其余多为 wheel）
+  trace "detect: 识别 sudo 组"
   if grep -q '^sudo:' /etc/group 2>/dev/null; then SUDO_GROUP=sudo
   elif grep -q '^wheel:' /etc/group 2>/dev/null; then SUDO_GROUP=wheel
   else SUDO_GROUP=""; fi
 
+  trace "detect: 探测 sshd（二进制/版本/服务名）"
   plat_detect_ssh
+  trace "detect: 探测防火墙（firewall-cmd / ufw）"
   fw_detect
+  trace "detect: 完成（家族=$PLAT_FAMILY 包管理器=$PKG init=$INIT 防火墙=$FW_BACKEND）"
 }
 
 plat_report() {
@@ -634,11 +648,13 @@ fw_detect() {
   local forced="${VPS_FW:-}"
 
   # 1) 已在运行的防火墙优先（这两个命令在守护进程异常时可能长时间无响应，必须限时）
+  trace "firewall: 检查 firewalld 是否在运行"
   if need_cmd firewall-cmd && LC_ALL=C run_timed 5 firewall-cmd --state >/dev/null 2>&1; then
     FW_BACKEND=firewalld; FW_WHY="firewalld 正在运行（本机现有防火墙，优先沿用）"
   elif need_cmd ufw && LC_ALL=C run_timed 8 ufw status 2>/dev/null | grep -qi '^Status: active'; then
     FW_BACKEND=ufw; FW_WHY="ufw 已启用（本机现有防火墙，优先沿用）"
   fi
+  trace "firewall: 现有防火墙检测完成（${FW_BACKEND:-无}）"
 
   # 2) 按发行版默认
   if [ -z "$FW_BACKEND" ]; then
@@ -870,15 +886,19 @@ plat_detect_ssh() {
 
   SSHD_VER=""
   if [ -n "$SSHD_BIN" ]; then
-    SSHD_VER=$("$SSHD_BIN" -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9][0-9.]*\).*/\1/p' | head -n1)
+    trace "detect: 运行 $SSHD_BIN -V"
+    SSHD_VER=$(run_timed 5 "$SSHD_BIN" -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9][0-9.]*\).*/\1/p' | head -n1)
   fi
   if [ -z "$SSHD_VER" ] && need_cmd ssh; then
-    SSHD_VER=$(ssh -V 2>&1 | head -n1 | sed -n 's/.*OpenSSH_\([0-9][0-9.]*\).*/\1/p')
+    SSHD_VER=$(run_timed 5 ssh -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9][0-9.]*\).*/\1/p' | head -n1)
   fi
 
   # sshd -T 支持情况（OpenSSH >= 6.8）
   SSHD_T_OK=0
-  if [ -n "$SSHD_BIN" ] && "$SSHD_BIN" -T >/dev/null 2>&1; then SSHD_T_OK=1; fi
+  if [ -n "$SSHD_BIN" ]; then
+    trace "detect: 测试 sshd -T 是否可用"
+    if run_timed 5 "$SSHD_BIN" -T >/dev/null 2>&1; then SSHD_T_OK=1; fi
+  fi
 
   # 版本相关的键盘交互认证关键字（8.7 起改名）
   local vmaj vmin
@@ -893,6 +913,7 @@ plat_detect_ssh() {
   fi
 
   # 服务名
+  trace "detect: 解析 SSH 服务名"
   SSH_SVC=""
   for cand in ssh sshd; do
     if svc_exists "$cand"; then SSH_SVC="$cand"; break; fi
@@ -901,8 +922,9 @@ plat_detect_ssh() {
 
   SSH_SOCKET=""
   if [ "$INIT" = "systemd" ]; then
+    trace "detect: 检查 socket 激活单元"
     for sock in ssh.socket sshd.socket; do
-      if systemctl list-unit-files 2>/dev/null | grep -q "^${sock}[[:space:]]"; then SSH_SOCKET="$sock"; break; fi
+      if run_timed 5 systemctl list-unit-files 2>/dev/null | grep -q "^${sock}[[:space:]]"; then SSH_SOCKET="$sock"; break; fi
     done
   fi
 }

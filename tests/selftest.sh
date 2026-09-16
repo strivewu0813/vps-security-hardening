@@ -174,6 +174,11 @@ out=$(run_engine --mode password --setup-only 2>&1); rc=$?
 chk "--mode password 可解析" 0 "$rc"
 out=$(run_engine --mode bogus 2>&1)
 chk "--mode 非法值报错" 0 "$(printf '%s' "$out" | grep -q '需要 key 或 password' && echo 0 || echo 1)"
+out=$(run_engine --diag 2>&1); rc=$?
+chk "--diag 诊断模式可运行（退出码 0）" 0 "$rc"
+chk "--diag 打印逐条测量结果" 0 "$(printf '%s' "$out" | grep -q '命令不存在\|耗时' && echo 0 || echo 1)"
+out=$(VPS_TRACE=1 run_engine --setup-only 2>&1)
+chk "VPS_TRACE=1 会打印探测步骤" 0 "$(printf '%s' "$out" | grep -q 'detect:' && echo 0 || echo 1)"
 out=$(MODE=bogus run_engine --setup-only 2>&1)
 chk "环境变量 MODE 非法值被拒绝" 0 "$(printf '%s' "$out" | grep -q 'MODE 只能是 key 或 password' && echo 0 || echo 1)"
 
