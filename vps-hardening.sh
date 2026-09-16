@@ -314,7 +314,7 @@ os_check() {
   run_timed 10 net_addrs 2>/dev/null | sed 's/^/  /' || warn "无 ip/ifconfig 可用"
 
   info "[4/5] SSH 端口与监听端口（最多 10 秒）"
-  info "  检测到的 SSH 端口: $(all_ssh_ports | tr '\n' ' ')"
+  info "  检测到的 SSH 端口: $(run_timed 10 all_ssh_ports | tr '\n' ' ')"
   run_timed 10 net_listen 2>/dev/null | sed 's/^/  /' || warn "无 ss/netstat 可用"
 
   info "[5/5] 需要你手动完成的事项"
@@ -949,7 +949,7 @@ step7_listeners() {
   run_timed 10 net_listen 2>/dev/null | sed 's/^/  /' || { err "无 ss/netstat/sockstat 可用"; return 1; }
   echo
   info "运行中的服务:"
-  svc_list_running 2>/dev/null | sed 's/^/  /' | head -n 40
+  run_timed 10 svc_list_running 2>/dev/null | sed 's/^/  /' | head -n 40
   echo
   info "常见需确认的端口: 21 FTP / 23 Telnet / 25 SMTP / 3306 MySQL / 5432 PostgreSQL / 6379 Redis / 2375 Docker API"
   info "判断三要素：程序是否监听 + 防火墙是否允许 + 是否有其它端口发布机制（如 Docker）。"
@@ -1057,7 +1057,7 @@ step9_xui_panel() {
     return 0
   fi
   ok "检测到 x-ui 服务，监听情况:"
-  net_listen 2>/dev/null | grep -i x-ui | sed 's/^/  /' || true
+  run_timed 10 net_listen 2>/dev/null | grep -i x-ui | sed 's/^/  /' || true
   cat <<'EOF' | sed 's/^/  /'
   面板安全检查项：
    1. 管理员账号：非默认用户名 + 独立长密码，不与其他网站共用

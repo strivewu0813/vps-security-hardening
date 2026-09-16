@@ -38,15 +38,41 @@ confirm() {
   case "${ans,,}" in y|yes) return 0;; *) return 1;; esac
 }
 
-# 带超时地运行命令（BSD 默认没有 timeout；能用就用，不能用就直接跑）
-# 注意：shell 函数不能交给 timeout 执行，必须直接调用
+# 带超时地运行命令 **或** shell 函数
+#
+# 要点（这几条都是踩过的坑）：
+#  1) shell 函数不能交给 timeout（它只能运行可执行文件）；
+#  2) bash 在等待前台子进程时会“延迟”处理 SIGTERM，所以只发 TERM 无效，必须升级到 KILL；
+#  3) 被超时的子进程会继承 stdout 管道，导致调用方的 $( ) 一直等到它们退出 —— 因此
+#     这里把子进程的 stdout 重定向到临时文件，函数结束后再交给调用方。
 run_timed() {
   local secs="$1"; shift
-  if declare -F "$1" >/dev/null 2>&1; then
-    "$@"
+
+  # 外部命令且系统有 timeout：直接用 timeout（它能正确清理子进程）
+  if ! declare -F "$1" >/dev/null 2>&1 && need_cmd timeout; then
+    HAVE_TIMEOUT=1
+    timeout "$secs" "$@"
     return $?
   fi
-  if need_cmd timeout; then HAVE_TIMEOUT=1; timeout "$secs" "$@"; else "$@"; fi
+
+  local tmpf pid wd rc
+  tmpf=$(mktemp 2>/dev/null) || tmpf=""
+  if [ -n "$tmpf" ]; then
+    if declare -F "$1" >/dev/null 2>&1; then ( "$@" >"$tmpf" ) & else ( exec "$@" >"$tmpf" ) & fi
+  else
+    if declare -F "$1" >/dev/null 2>&1; then ( "$@" ) & else ( exec "$@" ) & fi
+  fi
+  pid=$!
+  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid"; rc=$?
+  kill -KILL "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  if [ -n "$tmpf" ]; then
+    cat "$tmpf" 2>/dev/null
+    rm -f "$tmpf"
+  fi
+  return $rc
 }
 
 # 带超时的确认：无输入/EOF 时按默认值处理（避免“卡住不动”）
@@ -278,7 +304,7 @@ pkg_install_fail2ban() {
 svc_exists() {
   local n="$1"
   case "$INIT" in
-    systemd) systemctl list-unit-files 2>/dev/null | grep -q "^${n}\.service[[:space:]]" ;;
+    systemd) run_timed 5 systemctl list-unit-files 2>/dev/null | grep -q "^${n}\.service[[:space:]]" ;;
     openrc)  [ -x "/etc/init.d/$n" ] ;;
     sysv)    [ -x "/etc/init.d/$n" ] ;;
     runit)   [ -d "/etc/sv/$n" ] || [ -d "/var/service/$n" ] ;;
@@ -466,7 +492,7 @@ EOF
 
 svc_list_running() {
   case "$INIT" in
-    systemd) systemctl --type=service --state=running 2>/dev/null ;;
+    systemd) run_timed 10 systemctl --type=service --state=running 2>/dev/null ;;
     openrc)  rc-status --servicedir /etc/init.d 2>/dev/null | head -n 60 ;;
     sysv)
       if need_cmd chkconfig; then
@@ -489,14 +515,14 @@ net_addrs() {
 
 net_listen() {
   if need_cmd ss; then
-    ss -lntup 2>/dev/null || ss -lntu 2>/dev/null
+    run_timed 10 ss -lntup 2>/dev/null || run_timed 10 ss -lntu 2>/dev/null
   elif need_cmd sockstat; then
     # BSD：sockstat 是原生工具，优先于 netstat（BSD 的 netstat 没有 -l/-t/-u）
-    sockstat -4 -6 -l 2>/dev/null || sockstat -4 -l 2>/dev/null
+    run_timed 10 sockstat -4 -6 -l 2>/dev/null || run_timed 10 sockstat -4 -l 2>/dev/null
   elif need_cmd netstat; then
     case "$PLAT_FAMILY" in
-      bsd) netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN' ;;
-      *)   netstat -lntup 2>/dev/null || netstat -lntu 2>/dev/null ;;
+      bsd) run_timed 10 netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN' ;;
+      *)   run_timed 10 netstat -lntup 2>/dev/null || run_timed 10 netstat -lntu 2>/dev/null ;;
     esac
   else
     return 1
@@ -507,13 +533,13 @@ net_listen() {
 listen_port_ok() {
   local port="$1" out=""
   if need_cmd ss; then
-    out=$(ss -ltn 2>/dev/null)
+    out=$(run_timed 5 ss -ltn 2>/dev/null)
   elif need_cmd sockstat; then
-    out=$(sockstat -4 -6 -l 2>/dev/null || sockstat -4 -l 2>/dev/null)
+    out=$(run_timed 5 sockstat -4 -6 -l 2>/dev/null || run_timed 5 sockstat -4 -l 2>/dev/null)
   elif need_cmd netstat; then
     case "$PLAT_FAMILY" in
-      bsd) out=$(netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN') ;;
-      *)   out=$(netstat -ltn 2>/dev/null) ;;
+      bsd) out=$(run_timed 5 netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN') ;;
+      *)   out=$(run_timed 5 netstat -ltn 2>/dev/null) ;;
     esac
   else
     return 2
@@ -524,11 +550,11 @@ listen_port_ok() {
 
 all_ssh_ports() {
   {
-    [ -n "$SSHD_BIN" ] && "$SSHD_BIN" -T 2>/dev/null | awk '/^port /{print $2}'
+    [ -n "$SSHD_BIN" ] && run_timed 5 "$SSHD_BIN" -T 2>/dev/null | awk '/^port /{print $2}'
     if [ "$INIT" = "systemd" ] && need_cmd systemctl; then
-      systemctl show -p Listen --value ssh.socket 2>/dev/null | tr ' ' '\n' \
+      run_timed 3 systemctl show -p Listen --value ssh.socket 2>/dev/null | tr ' ' '\n' \
         | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p'
-      systemctl show -p ListenStream --value sshd.socket 2>/dev/null | tr ' ' '\n' \
+      run_timed 3 systemctl show -p ListenStream --value sshd.socket 2>/dev/null | tr ' ' '\n' \
         | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p'
     fi
     # 老版本 OpenSSH（无 sshd -T）或 BSD：从配置文件里读 Port
@@ -550,13 +576,13 @@ current_session_port() {
     p=""
     # 只认 LISTEN 中的 sshd（避免把 ssh -L 本地转发端口当成 SSH 服务端口）
     if need_cmd ss; then
-      p=$(ss -ltnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
+      p=$(run_timed 5 ss -ltnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
     elif need_cmd sockstat; then
-      p=$(sockstat -4 -6 -l 2>/dev/null | awk '/sshd/{print $6}' | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
+      p=$(run_timed 5 sockstat -4 -6 -l 2>/dev/null | awk '/sshd/{print $6}' | sed -n 's/.*[:.]\([0-9]\{1,5\}\)$/\1/p' | head -n1)
     elif need_cmd netstat; then
       case "$PLAT_FAMILY" in
-        bsd) p=$(netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN' | awk '{print $4}' | sed -n 's/.*[.:]\([0-9]\{1,5\}\)$/\1/p' | head -n1) ;;
-        *)   p=$(netstat -ltnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[.:]\([0-9]\{1,5\}\)$/\1/p' | head -n1) ;;
+        bsd) p=$(run_timed 5 netstat -an -f inet 2>/dev/null | grep -i '[[:space:]]LISTEN' | awk '{print $4}' | sed -n 's/.*[.:]\([0-9]\{1,5\}\)$/\1/p' | head -n1) ;;
+        *)   p=$(run_timed 5 netstat -ltnp 2>/dev/null | awk '/sshd/{print $4}' | sed -n 's/.*[.:]\([0-9]\{1,5\}\)$/\1/p' | head -n1) ;;
       esac
     fi
   fi
@@ -607,10 +633,10 @@ fw_detect() {
   FW_BACKEND=""; FW_WHY=""
   local forced="${VPS_FW:-}"
 
-  # 1) 已在运行的防火墙优先
-  if need_cmd firewall-cmd && LC_ALL=C firewall-cmd --state >/dev/null 2>&1; then
+  # 1) 已在运行的防火墙优先（这两个命令在守护进程异常时可能长时间无响应，必须限时）
+  if need_cmd firewall-cmd && LC_ALL=C run_timed 5 firewall-cmd --state >/dev/null 2>&1; then
     FW_BACKEND=firewalld; FW_WHY="firewalld 正在运行（本机现有防火墙，优先沿用）"
-  elif need_cmd ufw && LC_ALL=C ufw status 2>/dev/null | grep -qi '^Status: active'; then
+  elif need_cmd ufw && LC_ALL=C run_timed 8 ufw status 2>/dev/null | grep -qi '^Status: active'; then
     FW_BACKEND=ufw; FW_WHY="ufw 已启用（本机现有防火墙，优先沿用）"
   fi
 
@@ -653,10 +679,10 @@ fw_detect() {
 
 fw_is_active() {
   case "$FW_BACKEND" in
-    ufw)       ufw status 2>/dev/null | grep -qi '^Status: active' ;;
-    firewalld) firewall-cmd --state >/dev/null 2>&1 ;;
-    nftables)  [ -n "$(nft list ruleset 2>/dev/null)" ] ;;
-    iptables)  iptables -S 2>/dev/null | grep -q -- '-A INPUT' ;;
+    ufw)       LC_ALL=C run_timed 8 ufw status 2>/dev/null | grep -qi '^Status: active' ;;
+    firewalld) run_timed 5 firewall-cmd --state >/dev/null 2>&1 ;;
+    nftables)  [ -n "$(run_timed 5 nft list ruleset 2>/dev/null)" ] ;;
+    iptables)  run_timed 5 iptables -S 2>/dev/null | grep -q -- '-A INPUT' ;;
     *)         return 1 ;;
   esac
 }

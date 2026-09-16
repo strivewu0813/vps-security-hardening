@@ -240,6 +240,20 @@ chk "装好的引擎可运行（--setup-only 退出码 0）" 0 "$rc2"
 chk "装好的引擎打印平台报告" 0 "$(printf '%s' "$out2" | grep -q '系统     :' && echo 0 || echo 1)"
 rm -rf "$SBX"
 
+echo "== 14. run_timed 必须真的能对函数超时（预检卡死的根因）=="
+hang_fn() { sleep 30; echo "不该看到这行"; }
+start=$(date +%s)
+out=$(run_timed 2 hang_fn 2>/dev/null)
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+chk "run_timed 对卡住的函数会超时返回（≤6s）" 0 "$([ "$elapsed" -le 6 ] && echo 0 || echo 1)"
+chk "run_timed 超时后返回非 0" 1 "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+chk "超时函数没有输出残留" "" "$(printf '%s' "$out" | grep -v '不该看到这行')"
+fast_fn() { echo "ok-fast"; }
+chk "run_timed 对正常函数返回 0" 0 "$(run_timed 5 fast_fn >/dev/null 2>&1; echo $?)"
+chk "run_timed 正常函数输出正确" "ok-fast" "$(run_timed 5 fast_fn 2>/dev/null)"
+chk "run_timed 对外部命令超时返回 124" 124 "$(run_timed 1 sleep 30; echo $?)"
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" = "0" ]
